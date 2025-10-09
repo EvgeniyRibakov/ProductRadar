@@ -399,3 +399,4 @@ python scripts/run_agent.py
 **Ответственный:** AI + Developer  
 **ETA завершения ФАЗЫ 1:** 23 октября 2025
 
+
