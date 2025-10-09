@@ -1,0 +1,64 @@
+[tool.poetry]
+name = "productradar"
+version = "0.1.0"
+description = "AI Agent для анализа продуктов"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+openai = "^1.12.0"
+anthropic = "^0.18.0"
+langchain = "^0.1.9"
+langchain-openai = "^0.0.5"
+langchain-anthropic = "^0.1.4"
+python-dotenv = "^1.0.0"
+pydantic = "^2.6.0"
+pydantic-settings = "^2.1.0"
+requests = "^2.31.0"
+aiohttp = "^3.9.3"
+fastapi = "^0.109.2"
+uvicorn = {extras = ["standard"], version = "^0.27.1"}
+sqlalchemy = "^2.0.25"
+alembic = "^1.13.1"
+redis = "^5.0.1"
+celery = "^5.3.6"
+numpy = "^1.26.4"
+pandas = "^2.2.0"
+beautifulsoup4 = "^4.12.3"
+lxml = "^5.1.0"
+google-api-python-client = "^2.100.0"
+google-auth-httplib2 = "^0.1.1"
+google-auth-oauthlib = "^1.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.5"
+pytest-cov = "^4.1.0"
+black = "^24.2.0"
+isort = "^5.13.2"
+flake8 = "^7.0.0"
+mypy = "^1.8.0"
+pre-commit = "^3.6.2"
+ipython = "^8.21.0"
+jupyter = "^1.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+addopts = "-v --cov=src --cov-report=html --cov-report=term"
+
