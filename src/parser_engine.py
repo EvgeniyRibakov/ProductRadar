@@ -76,8 +76,8 @@ class ParserEngine:
         log.info(f"Получение {count} товаров со страницы поиска...")
         
         try:
-            # Ждем загрузки страницы
-            await self.page.wait_for_load_state("networkidle")
+            # Ждем загрузки страницы (domcontentloaded быстрее, чем networkidle)
+            await self.page.wait_for_load_state("domcontentloaded")
             await self.human_delay(2, 3)
             
             # Скроллим вниз, чтобы загрузились карточки товаров
@@ -201,7 +201,7 @@ class ParserEngine:
             log.error(traceback.format_exc())
             return []
     
-    async def get_product_details(self, product_url: str) -> ProductData:
+    async def get_product_details(self, product_url: str, sheets_writer=None) -> ProductData:
         """
         Получить детали товара и видео
         
@@ -311,20 +311,23 @@ class ParserEngine:
                 log.error(f"  ❌ Ошибка при скролле: {e}")
                 # Продолжаем работу
             
-            # Получение названия товара - пробуем больше селекторов
+            # Получение названия товара - пробуем больше селекторов и методов
             log.info("  → Поиск названия товара через селекторы...")
             try:
-                # Важно: берем первый h1, который не содержит служебной информации
+                # Метод 1: Поиск через селекторы (приоритет)
                 name_selectors = [
                     'h1:first-of-type',
                     'h1[class*="product"]',
                     'h1[class*="title"]',
-                    '[class*="product-title"]:not([class*="stock"]):not([class*="remain"])',
+                    '[class*="product-title"]',
                     '[class*="product-name"]',
+                    '[class*="product_title"]',
+                    '[class*="product_name"]',
                     'h1',
                     'h2:first-of-type',
                     '[data-testid*="title"]',
                     '[data-testid*="name"]',
+                    '[data-testid*="product-title"]',
                 ]
                 
                 for selector in name_selectors:
@@ -335,30 +338,71 @@ class ParserEngine:
                             if name and len(name) > 3:
                                 # Фильтруем служебные тексты
                                 name_lower = name.lower()
-                                if any(skip in name_lower for skip in ['остаток', 'remain', 'stock', 'месяц', 'month', 'комиссия', 'commission']):
+                                skip_words = ['остаток', 'remain', 'stock', 'месяц', 'month', 'комиссия', 'commission', 
+                                            'tiktok shop product detail', 'category', 'категория']
+                                if any(skip in name_lower for skip in skip_words):
                                     continue
+                                # Убираем префикс "TikTok Shop Product Detail:" если есть
+                                if "TikTok Shop Product Detail:" in name:
+                                    name = name.split("TikTok Shop Product Detail:")[-1].strip()
+                                if ":" in name and len(name.split(":")[0]) < 20:
+                                    name = name.split(":", 1)[-1].strip()
                                 product_data.product_name = name.strip()
-                                log.info(f"  ✅ Название товара найдено: {product_data.product_name[:50]}...")
-                                break
-                        if product_data.product_name:
+                                if len(product_data.product_name) > 5:
+                                    log.info(f"  ✅ Название товара найдено: {product_data.product_name[:50]}...")
+                                    break
+                        if product_data.product_name and len(product_data.product_name) > 5:
                             break
                     except:
                         continue
                 
-                # Если не нашли, пробуем получить из URL или мета-тегов
-                if not product_data.product_name or product_data.product_name == "":
+                # Метод 2: Поиск через JavaScript (более агрессивный)
+                if not product_data.product_name or len(product_data.product_name) <= 5:
                     try:
-                        # Пробуем получить из title страницы
-                        title = await self.page.title()
-                        if title and len(title) > 3:
-                            product_data.product_name = title.strip()
-                            log.info(f"  ✅ Название товара найдено (из title): {product_data.product_name[:50]}...")
+                        product_name = await self.page.evaluate("""
+                            () => {
+                                // Ищем h1
+                                const h1 = document.querySelector('h1');
+                                if (h1) {
+                                    const text = h1.innerText.trim();
+                                    if (text && text.length > 5 && !text.toLowerCase().includes('tiktok shop product detail')) {
+                                        return text;
+                                    }
+                                }
+                                
+                                // Ищем в элементах с классом product
+                                const productElements = document.querySelectorAll('[class*="product"][class*="title"], [class*="product"][class*="name"]');
+                                for (const el of productElements) {
+                                    const text = el.innerText.trim();
+                                    if (text && text.length > 5) {
+                                        return text;
+                                    }
+                                }
+                                
+                                // Ищем в мета-тегах
+                                const ogTitle = document.querySelector('meta[property="og:title"]');
+                                if (ogTitle && ogTitle.content) {
+                                    let title = ogTitle.content;
+                                    if (title.includes('TikTok Shop Product Detail:')) {
+                                        title = title.split('TikTok Shop Product Detail:')[1].trim();
+                                    }
+                                    if (title && title.length > 5) {
+                                        return title;
+                                    }
+                                }
+                                
+                                return null;
+                            }
+                        """)
+                        if product_name and len(product_name) > 5:
+                            product_data.product_name = product_name.strip()
+                            log.info(f"  ✅ Название товара найдено (через JS): {product_data.product_name[:50]}...")
                     except Exception as e:
-                        log.debug(f"  → Ошибка при получении title: {e}")
+                        log.debug(f"  → Ошибка при поиске через JS: {e}")
             except Exception as e:
                 log.error(f"  ❌ Ошибка при извлечении названия товара: {e}")
             
-            if not product_data.product_name or product_data.product_name == "":
+            if not product_data.product_name or len(product_data.product_name) <= 5:
                 log.warning("  ⚠️ Название товара не найдено, будет установлено 'N/A'")
                 product_data.product_name = "N/A"
             
@@ -366,23 +410,87 @@ class ParserEngine:
             log.info("\n📌 ШАГ 3: Извлечение Category...")
             try:
                 log.info("  → Поиск категории товара...")
+                
+                # Метод 1: Поиск через селекторы
                 category_selectors = [
                     '[class*="category"]',
                     '[class*="tag"]',
                     'span:has-text("Category")',
+                    'span:has-text("Категория")',
+                    'text=/Category/i',
+                    'text=/Категория/i',
+                    'div:has-text("Category")',
+                    'div:has-text("Категория")',
                 ]
                 
                 for selector in category_selectors:
                     try:
-                        element = await self.page.query_selector(selector)
-                        if element:
+                        elements = await self.page.query_selector_all(selector)
+                        for element in elements:
                             category = await element.inner_text()
-                            if category and len(category) < 100:
-                                product_data.category = category.strip()
-                                log.info(f"  ✅ Категория найдена: {product_data.category}")
-                                break
+                            if category:
+                                # Очищаем от лишнего текста
+                                category = re.sub(r'Category\s*:', '', category, flags=re.IGNORECASE)
+                                category = re.sub(r'Категория\s*:', '', category, flags=re.IGNORECASE)
+                                category = re.sub(r'Commission\s*Rate\s*:.*', '', category, flags=re.IGNORECASE)
+                                category = re.sub(r'Комиссия\s*:.*', '', category, flags=re.IGNORECASE)
+                                # Убираем лишние символы > и пробелы
+                                category = re.sub(r'\s*>\s*', ' > ', category)
+                                category = category.strip()
+                                # Берем только первую часть до "Commission" или ограничиваем длину
+                                if "Commission" in category or "Комиссия" in category:
+                                    category = category.split("Commission")[0].split("Комиссия")[0].strip()
+                                if len(category) > 100:
+                                    category = category[:100]
+                                if category and len(category) > 3:
+                                    product_data.category = category
+                                    log.info(f"  ✅ Категория найдена: {product_data.category}")
+                                    break
+                        if product_data.category:
+                            break
                     except:
                         continue
+                
+                # Метод 2: Поиск через JavaScript (более агрессивный)
+                if not product_data.category:
+                    try:
+                        category = await self.page.evaluate("""
+                            () => {
+                                // Ищем элементы с текстом "Category" или "Категория"
+                                const allElements = document.querySelectorAll('*');
+                                for (const el of allElements) {
+                                    const text = el.innerText || '';
+                                    if (text.includes('Category') || text.includes('Категория')) {
+                                        // Извлекаем категорию после "Category:" или "Категория:"
+                                        let categoryText = text;
+                                        if (categoryText.includes('Category:')) {
+                                            categoryText = categoryText.split('Category:')[1];
+                                        } else if (categoryText.includes('Категория:')) {
+                                            categoryText = categoryText.split('Категория:')[1];
+                                        }
+                                        
+                                        // Убираем "Commission Rate" и все после
+                                        if (categoryText.includes('Commission Rate') || categoryText.includes('Комиссия')) {
+                                            categoryText = categoryText.split('Commission Rate')[0].split('Комиссия')[0];
+                                        }
+                                        
+                                        categoryText = categoryText.trim();
+                                        
+                                        // Проверяем, что это похоже на категорию (содержит ">" или несколько слов)
+                                        if (categoryText && categoryText.length > 3 && 
+                                            (categoryText.includes('>') || categoryText.split(' ').length >= 2)) {
+                                            return categoryText.substring(0, 100);
+                                        }
+                                    }
+                                }
+                                return null;
+                            }
+                        """)
+                        if category and len(category) > 3:
+                            product_data.category = category.strip()
+                            log.info(f"  ✅ Категория найдена (через JS): {product_data.category}")
+                    except Exception as e:
+                        log.debug(f"  → Ошибка при поиске категории через JS: {e}")
                 
                 if not product_data.category:
                     log.warning("  ⚠️ Категория не найдена, будет установлена 'N/A'")
@@ -390,6 +498,38 @@ class ParserEngine:
             except Exception as e:
                 log.error(f"  ❌ Ошибка при извлечении категории: {e}")
                 product_data.category = "N/A"
+            
+            # ШАГ 3.5: Запись базовых данных в Google Sheets (если sheets_writer передан)
+            # ВАЖНО: Если ячейки защищены, пропускаем запись базовых данных и записываем только видео
+            if sheets_writer:
+                log.info("\n📌 ШАГ 3.5: Запись базовых данных в Google Sheets...")
+                try:
+                    row_number = sheets_writer.write_basic_product_data(
+                        product_data.product_name,
+                        product_data.category,
+                        product_data.pipiads_link
+                    )
+                    if row_number > 0:
+                        # Сохраняем номер строки для последующей записи видео
+                        product_data._sheets_row = row_number
+                        log.info(f"  ✅ Базовые данные записаны в Google Sheets (строка {row_number})")
+                    else:
+                        # Если не удалось записать базовые данные (возможно, ячейки защищены),
+                        # находим пустую строку для записи только видео данных
+                        log.warning("  ⚠️ Ошибка при записи базовых данных (возможно, ячейки защищены)")
+                        log.info("  → Находим пустую строку для записи видео данных...")
+                        row_number = sheets_writer.find_next_empty_row()
+                        product_data._sheets_row = row_number
+                        log.info(f"  ✅ Будем записывать видео данные в строку {row_number}")
+                except Exception as e:
+                    log.warning(f"  ⚠️ Ошибка при записи базовых данных: {e}")
+                    # Находим пустую строку для записи только видео
+                    try:
+                        row_number = sheets_writer.find_next_empty_row()
+                        product_data._sheets_row = row_number
+                        log.info(f"  → Будем записывать видео данные в строку {row_number}")
+                    except:
+                        pass
             
             # ШАГ 4: Поиск блока "TikTok Ads"
             log.info("\n📌 ШАГ 4: Поиск блока 'TikTok Ads'...")
@@ -1113,48 +1253,58 @@ class ParserEngine:
             # Получаем весь текст страницы для поиска
             page_text = await self.page.content()
             
-            # 1. TikTok ссылка (из поля "TikTok Post" или "Пост TikTok")
-            tiktok_link_selectors = [
-                'a[href*="tiktok.com"]',
-                'a[href*="m.tiktok.com"]',
-                'text="TikTok Post"',  # Английский приоритет
-                'text="Пост TikTok"',  # Русский fallback
+            # 1. TikTok ссылка (из поля "TikTok Post" (англ.) или "Пост TikTok" (рус.))
+            log.info("      → Извлечение TikTok ссылки...")
+            
+            # Сначала ищем по тексту "TikTok Post" или "Пост TikTok"
+            tiktok_post_selectors = [
+                'text=/TikTok Post/i',  # Английский приоритет
+                'text=/Пост TikTok/i',  # Русский fallback
             ]
             
-            for selector in tiktok_link_selectors:
+            for selector in tiktok_post_selectors:
                 try:
-                    if 'text=' in selector:
-                        # Ищем по тексту и берем ссылку рядом
-                        element = await self.page.query_selector(selector)
-                        if element:
-                            # Ищем ссылку в родительском элементе или рядом
-                            try:
-                                # Используем locator для поиска родительского элемента
-                                locator = self.page.locator(selector).first
-                                parent_locator = locator.locator("..")
-                                link = await parent_locator.locator('a[href*="tiktok.com"]').first.element_handle()
-                                if link:
-                                    href = await link.get_attribute("href")
-                                    if href:
-                                        video_data["tiktok_link"] = href
-                                        break
-                            except:
-                                # Fallback: ищем ссылку на странице
-                                link = await self.page.query_selector('a[href*="tiktok.com"]')
-                                if link:
-                                    href = await link.get_attribute("href")
-                                    if href:
-                                        video_data["tiktok_link"] = href
-                                        break
-                    else:
-                        link = await self.page.query_selector(selector)
-                        if link:
-                            href = await link.get_attribute("href")
-                            if href and "tiktok.com" in href:
-                                video_data["tiktok_link"] = href
-                                break
+                    locator = self.page.locator(selector).first
+                    if await locator.count() > 0:
+                        # Ищем ссылку рядом
+                        try:
+                            parent_locator = locator.locator("..")
+                            link = await parent_locator.locator('a[href*="tiktok.com"]').first.element_handle()
+                            if link:
+                                href = await link.get_attribute("href")
+                                if href:
+                                    video_data["tiktok_link"] = href
+                                    log.info(f"      ✅ TikTok ссылка найдена: {href[:50]}...")
+                                    break
+                        except:
+                            pass
                 except:
                     continue
+            
+            # Если не нашли через текст, ищем все ссылки на TikTok
+            if video_data["tiktok_link"] == "N/A":
+                tiktok_link_selectors = [
+                    'a[href*="tiktok.com"]',
+                    'a[href*="m.tiktok.com"]',
+                ]
+                
+                for selector in tiktok_link_selectors:
+                    try:
+                        links = await self.page.query_selector_all(selector)
+                        for link in links:
+                            href = await link.get_attribute("href")
+                            if href and "tiktok.com" in href:
+                                # Берем первую валидную ссылку
+                                video_data["tiktok_link"] = href
+                                log.info(f"      ✅ TikTok ссылка найдена: {href[:50]}...")
+                                break
+                        if video_data["tiktok_link"] != "N/A":
+                            break
+                    except:
+                        continue
+            
+            if video_data["tiktok_link"] == "N/A":
+                log.warning("      ⚠️ TikTok ссылка не найдена")
             
             # 2. Impressions - КРИТИЧНО: "Impressions" (англ.) или "Показы" (рус.), не "Likes" или "Нравится"!
             log.info("      → Извлечение impressions...")
@@ -1245,10 +1395,10 @@ class ParserEngine:
             # Если не нашли по паттерну, ищем элемент с текстом "Impressions" или "Показы"
             try:
                 # Сначала английский
-                impression_locator = self.page.locator('text="Impressions"').first
+                impression_locator = self.page.locator('text=/Impressions/i').first
                 if await impression_locator.count() == 0:
                     # Fallback на русский
-                    impression_locator = self.page.locator('text="Показы"').first
+                    impression_locator = self.page.locator('text=/Показы/i').first
                 
                 if await impression_locator.count() > 0:
                     # Ищем число рядом с этим элементом - используем locator для родителя
@@ -1269,33 +1419,90 @@ class ParserEngine:
     async def _extract_script(self) -> Optional[str]:
         """Извлечь сценарий из секции 'Transcript' или 'Анализ транскрипта'"""
         try:
-            # Ищем секцию "Transcript" (англ.) или "Анализ транскрипта" (рус.) - приоритет английскому
-            transcript_selectors = [
-                'text="Transcript"',  # Английский приоритет
-                'text="Анализ транскрипта"',  # Русский fallback
-                '[class*="transcript"]',
-            ]
+            # Метод 1: Поиск через локаторы (английский и русский)
+            transcript_keywords = ["Transcript", "Анализ транскрипта", "Транскрипт"]
             
-            for selector in transcript_selectors:
+            for keyword in transcript_keywords:
                 try:
-                    locator = self.page.locator(selector).first
+                    # Ищем элемент с текстом
+                    locator = self.page.locator(f'text=/{keyword}/i').first
                     if await locator.count() > 0:
-                        # Ищем текст сценария рядом - используем locator для родителя
-                        parent_text = await locator.locator("..").inner_text()
-                        # Извлекаем текст после "Transcript" (англ.) или "Анализ транскрипта" (рус.)
-                        parts = parent_text.split("Transcript")
-                        if len(parts) > 1:
-                            script = parts[1].strip()
-                            if script and len(script) > 10:
-                                return script
+                        # Способ 1: Текст родительского элемента
+                        try:
+                            parent_text = await locator.locator("..").inner_text()
+                            if keyword in parent_text:
+                                parts = parent_text.split(keyword, 1)
+                                if len(parts) > 1:
+                                    script = parts[1].strip()
+                                    # Убираем лишние метки
+                                    stop_words = ["Hook", "Хук", "Target Audience", "Целевая аудитория", 
+                                                "First seen", "Впервые замечено", "Impressions", "Показы"]
+                                    for stop_word in stop_words:
+                                        if stop_word in script:
+                                            script = script.split(stop_word)[0].strip()
+                                    if script and len(script) > 10:
+                                        log.debug(f"Script найден через '{keyword}' (родитель)")
+                                        return script
+                        except:
+                            pass
                         
-                        parts = parent_text.split("Анализ транскрипта")
-                        if len(parts) > 1:
-                            script = parts[1].strip()
-                            if script and len(script) > 10:
-                                return script
+                        # Способ 2: Текст следующего элемента
+                        try:
+                            next_sibling = await locator.evaluate_handle("el => el.nextElementSibling")
+                            if next_sibling:
+                                script = await next_sibling.as_element().inner_text()
+                                if script and len(script) > 10:
+                                    log.debug(f"Script найден через '{keyword}' (следующий элемент)")
+                                    return script.strip()
+                        except:
+                            pass
                 except:
                     continue
+            
+            # Метод 2: Поиск через JavaScript (более агрессивный)
+            try:
+                script = await self.page.evaluate("""
+                    () => {
+                        const keywords = ['Transcript', 'Анализ транскрипта', 'Транскрипт'];
+                        const stopWords = ['Hook', 'Хук', 'Target Audience', 'Целевая аудитория', 
+                                          'First seen', 'Впервые замечено', 'Impressions', 'Показы'];
+                        
+                        // Ищем все элементы с текстом
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            const text = el.innerText || '';
+                            
+                            for (const keyword of keywords) {
+                                if (text.includes(keyword)) {
+                                    // Извлекаем текст после ключевого слова
+                                    let scriptText = text;
+                                    if (scriptText.includes(keyword)) {
+                                        scriptText = scriptText.split(keyword)[1];
+                                        
+                                        // Убираем стоп-слова
+                                        for (const stopWord of stopWords) {
+                                            if (scriptText.includes(stopWord)) {
+                                                scriptText = scriptText.split(stopWord)[0];
+                                            }
+                                        }
+                                        
+                                        scriptText = scriptText.trim();
+                                        
+                                        if (scriptText && scriptText.length > 10) {
+                                            return scriptText;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if script and len(script) > 10:
+                    log.debug("Script найден через JavaScript")
+                    return script.strip()
+            except Exception as e:
+                log.debug(f"Ошибка при поиске script через JS: {e}")
             
             return None
             
@@ -1304,26 +1511,88 @@ class ParserEngine:
             return None
     
     async def _extract_hook(self) -> Optional[str]:
-        """Извлечь hook из секции Hook"""
+        """Извлечь hook из секции Hook (англ.) или Хук (рус.)"""
         try:
-            hook_selectors = [
-                'text="Hook"',
-                '[class*="hook"]',
-            ]
+            # Метод 1: Поиск через локаторы
+            hook_keywords = ["Hook", "Хук"]
             
-            for selector in hook_selectors:
+            for keyword in hook_keywords:
                 try:
-                    locator = self.page.locator(selector).first
+                    locator = self.page.locator(f'text=/{keyword}/i').first
                     if await locator.count() > 0:
-                        # Ищем текст hook рядом - используем locator для родителя
-                        parent_text = await locator.locator("..").inner_text()
-                        parts = parent_text.split("Hook")
-                        if len(parts) > 1:
-                            hook = parts[1].strip()
-                            if hook and len(hook) > 5:
-                                return hook
+                        # Способ 1: Текст родительского элемента
+                        try:
+                            parent_text = await locator.locator("..").inner_text()
+                            if keyword in parent_text:
+                                parts = parent_text.split(keyword, 1)
+                                if len(parts) > 1:
+                                    hook = parts[1].strip()
+                                    # Убираем лишние метки
+                                    stop_words = ["Target Audience", "Целевая аудитория", "First seen", "Впервые замечено", 
+                                                "Transcript", "Анализ транскрипта", "Impressions", "Показы"]
+                                    for stop_word in stop_words:
+                                        if stop_word in hook:
+                                            hook = hook.split(stop_word)[0].strip()
+                                    if hook and len(hook) > 5:
+                                        log.debug(f"Hook найден через '{keyword}' (родитель)")
+                                        return hook
+                        except:
+                            pass
+                        
+                        # Способ 2: Текст следующего элемента
+                        try:
+                            next_sibling = await locator.evaluate_handle("el => el.nextElementSibling")
+                            if next_sibling:
+                                hook = await next_sibling.as_element().inner_text()
+                                if hook and len(hook) > 5:
+                                    log.debug(f"Hook найден через '{keyword}' (следующий элемент)")
+                                    return hook.strip()
+                        except:
+                            pass
                 except:
                     continue
+            
+            # Метод 2: Поиск через JavaScript
+            try:
+                hook = await self.page.evaluate("""
+                    () => {
+                        const keywords = ['Hook', 'Хук'];
+                        const stopWords = ['Target Audience', 'Целевая аудитория', 'First seen', 'Впервые замечено', 
+                                         'Transcript', 'Анализ транскрипта', 'Impressions', 'Показы'];
+                        
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            const text = el.innerText || '';
+                            
+                            for (const keyword of keywords) {
+                                if (text.includes(keyword)) {
+                                    let hookText = text;
+                                    if (hookText.includes(keyword)) {
+                                        hookText = hookText.split(keyword)[1];
+                                        
+                                        for (const stopWord of stopWords) {
+                                            if (hookText.includes(stopWord)) {
+                                                hookText = hookText.split(stopWord)[0];
+                                            }
+                                        }
+                                        
+                                        hookText = hookText.trim();
+                                        
+                                        if (hookText && hookText.length > 5) {
+                                            return hookText;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if hook and len(hook) > 5:
+                    log.debug("Hook найден через JavaScript")
+                    return hook.strip()
+            except Exception as e:
+                log.debug(f"Ошибка при поиске hook через JS: {e}")
             
             return None
             
@@ -1336,18 +1605,14 @@ class ParserEngine:
         try:
             audience_data = {"age": "N/A", "platform": "N/A", "country": "N/A"}
             
-            # Ищем секцию "Target Audience" (англ.) или "Целевая аудитория" (рус.) - приоритет английскому
-            audience_selectors = [
-                'text="Target Audience"',  # Английский приоритет
-                'text="Целевая аудитория"',  # Русский fallback
-                '[class*="audience"]',
-            ]
+            # Метод 1: Поиск через локаторы
+            audience_keywords = ["Target Audience", "Целевая аудитория", "Audience", "Аудитория"]
             
-            for selector in audience_selectors:
+            for keyword in audience_keywords:
                 try:
-                    locator = self.page.locator(selector).first
+                    locator = self.page.locator(f'text=/{keyword}/i').first
                     if await locator.count() > 0:
-                        # Ищем текст аудитории рядом - используем locator для родителя
+                        # Ищем текст аудитории рядом
                         text = await locator.locator("..").inner_text()
                         
                         # Ищем возраст (формат "35-45", "18-24" и т.д.)
@@ -1355,28 +1620,84 @@ class ParserEngine:
                         if age_match:
                             audience_data["age"] = age_match.group(1)
                         
-                        # Ищем платформу (Android, iOS, iPhone, etc.)
+                        # Ищем платформу
                         platform_keywords = ["Android", "iOS", "iPhone", "iPad"]
-                        for keyword in platform_keywords:
-                            if keyword in text:
-                                # Нормализуем: iOS/iPhone/iPad -> iOS, остальное -> Android
-                                if keyword in ["iOS", "iPhone", "iPad"]:
+                        for platform_keyword in platform_keywords:
+                            if platform_keyword in text:
+                                if platform_keyword in ["iOS", "iPhone", "iPad"]:
                                     audience_data["platform"] = "iOS"
                                 else:
                                     audience_data["platform"] = "Android"
                                 break
                         
-                        # Ищем страну (обычно название страны)
-                        country_keywords = ["USA", "US", "United States", "Россия", "Russia", "Philippines", "Филиппины"]
-                        for keyword in country_keywords:
-                            if keyword in text:
-                                audience_data["country"] = keyword
+                        # Ищем страну (расширенный список)
+                        country_keywords = ["USA", "US", "United States", "Россия", "Russia", "Philippines", 
+                                          "Филиппины", "China", "Китай", "India", "Индия", "Brazil", "Бразилия",
+                                          "Germany", "Германия", "France", "Франция", "UK", "United Kingdom"]
+                        for country_keyword in country_keywords:
+                            if country_keyword in text:
+                                audience_data["country"] = country_keyword
                                 break
                         
                         if audience_data["age"] != "N/A" or audience_data["platform"] != "N/A" or audience_data["country"] != "N/A":
                             return audience_data
                 except:
                     continue
+            
+            # Метод 2: Поиск через JavaScript (более агрессивный)
+            try:
+                result = await self.page.evaluate("""
+                    () => {
+                        const keywords = ['Target Audience', 'Целевая аудитория', 'Audience', 'Аудитория'];
+                        const agePattern = /(\\d{1,2}-\\d{1,2})/;
+                        const platformKeywords = ['Android', 'iOS', 'iPhone', 'iPad'];
+                        const countryKeywords = ['USA', 'US', 'United States', 'Россия', 'Russia', 'Philippines', 
+                                                'Филиппины', 'China', 'Китай', 'India', 'Индия'];
+                        
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            const text = el.innerText || '';
+                            
+                            for (const keyword of keywords) {
+                                if (text.includes(keyword)) {
+                                    const result = {age: 'N/A', platform: 'N/A', country: 'N/A'};
+                                    
+                                    // Ищем возраст
+                                    const ageMatch = text.match(agePattern);
+                                    if (ageMatch) {
+                                        result.age = ageMatch[1];
+                                    }
+                                    
+                                    // Ищем платформу
+                                    for (const platform of platformKeywords) {
+                                        if (text.includes(platform)) {
+                                            result.platform = (platform === 'iOS' || platform === 'iPhone' || platform === 'iPad') ? 'iOS' : 'Android';
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // Ищем страну
+                                    for (const country of countryKeywords) {
+                                        if (text.includes(country)) {
+                                            result.country = country;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if (result.age !== 'N/A' || result.platform !== 'N/A' || result.country !== 'N/A') {
+                                        return result;
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if result:
+                    audience_data.update(result)
+                    return audience_data
+            except Exception as e:
+                log.debug(f"Ошибка при поиске audience через JS: {e}")
             
             return audience_data
             
@@ -1385,27 +1706,93 @@ class ParserEngine:
             return None
     
     async def _extract_first_seen(self) -> Optional[str]:
-        """Извлечь First seen в формате 'Oct 27 2025'"""
+        """Извлечь First seen в формате 'Oct 27 2025' (англ.) или 'Впервые замечено' (рус.)"""
         try:
-            # Ищем "First seen" на странице
-            first_seen_selectors = [
-                'text="First seen"',
-                '[class*="first-seen"]',
-            ]
+            # Метод 1: Поиск через локаторы
+            first_seen_keywords = ["First seen", "Впервые замечено", "First Seen"]
             
-            for selector in first_seen_selectors:
+            for keyword in first_seen_keywords:
                 try:
-                    locator = self.page.locator(selector).first
+                    locator = self.page.locator(f'text=/{keyword}/i').first
                     if await locator.count() > 0:
-                        # Ищем текст даты рядом - используем locator для родителя
+                        # Ищем текст даты рядом
                         text = await locator.locator("..").inner_text()
                         
-                        # Ищем дату в формате "Oct 27 2025"
-                        date_match = re.search(r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})', text)
-                        if date_match:
-                            return date_match.group(1)
+                        # Ищем дату в формате "Oct 27 2025" или "Oct 27, 2025"
+                        date_patterns = [
+                            r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})',  # Oct 27 2025
+                            r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})',  # Oct 27, 2025
+                            r'(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})',  # 27 Oct 2025
+                        ]
+                        
+                        for pattern in date_patterns:
+                            date_match = re.search(pattern, text)
+                            if date_match:
+                                date_str = date_match.group(1)
+                                # Нормализуем формат (убираем запятую если есть)
+                                date_str = date_str.replace(',', '').strip()
+                                log.debug(f"First seen найден через '{keyword}': {date_str}")
+                                return date_str
+                        
+                        # Также пробуем найти дату после ключевых слов
+                        if keyword in text:
+                            parts = text.split(keyword, 1)
+                            if len(parts) > 1:
+                                for pattern in date_patterns:
+                                    date_match = re.search(pattern, parts[1])
+                                    if date_match:
+                                        date_str = date_match.group(1).replace(',', '').strip()
+                                        log.debug(f"First seen найден после '{keyword}': {date_str}")
+                                        return date_str
                 except:
                     continue
+            
+            # Метод 2: Поиск через JavaScript (более агрессивный)
+            try:
+                first_seen = await self.page.evaluate("""
+                    () => {
+                        const keywords = ['First seen', 'Впервые замечено', 'First Seen'];
+                        const datePatterns = [
+                            /([A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{4})/,  // Oct 27 2025
+                            /([A-Z][a-z]{2}\\s+\\d{1,2},\\s+\\d{4})/,  // Oct 27, 2025
+                            /(\\d{1,2}\\s+[A-Z][a-z]{2}\\s+\\d{4})/   // 27 Oct 2025
+                        ];
+                        
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            const text = el.innerText || '';
+                            
+                            for (const keyword of keywords) {
+                                if (text.includes(keyword)) {
+                                    // Ищем дату после ключевого слова
+                                    const index = text.indexOf(keyword);
+                                    const afterKeyword = text.substring(index + keyword.length);
+                                    
+                                    for (const pattern of datePatterns) {
+                                        const match = afterKeyword.match(pattern);
+                                        if (match) {
+                                            return match[1].replace(',', '').trim();
+                                        }
+                                    }
+                                    
+                                    // Ищем дату в тексте элемента
+                                    for (const pattern of datePatterns) {
+                                        const match = text.match(pattern);
+                                        if (match) {
+                                            return match[1].replace(',', '').trim();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if first_seen:
+                    log.debug(f"First seen найден через JavaScript: {first_seen}")
+                    return first_seen.strip()
+            except Exception as e:
+                log.debug(f"Ошибка при поиске first_seen через JS: {e}")
             
             return None
             

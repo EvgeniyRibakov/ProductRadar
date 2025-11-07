@@ -183,7 +183,7 @@ class BrowserManager:
         self,
         url: str,
         max_retries: int = None,
-        wait_until: str = "networkidle",
+        wait_until: str = "domcontentloaded",
         timeout: int = None
     ) -> bool:
         """
@@ -214,9 +214,11 @@ class BrowserManager:
                 # Человеческая задержка перед навигацией
                 await self.human_delay()
                 
+                # Используем domcontentloaded вместо networkidle для надежности
+                effective_wait_until = wait_until if wait_until != "networkidle" else "domcontentloaded"
                 response = await self.page.goto(
                     url,
-                    wait_until=wait_until,
+                    wait_until=effective_wait_until,
                     timeout=timeout
                 )
                 
@@ -521,7 +523,7 @@ class BrowserManager:
             
             # Ждем, пока страница перезагрузится или изменится URL
             try:
-                await self.page.wait_for_load_state("networkidle", timeout=10000)
+                await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
             except:
                 pass
             

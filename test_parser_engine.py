@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.browser_manager import BrowserManager
-from src.parser_engine import ParserEngine
+from src.parser_engine import ParserEngine, ProductData
+from src.sheets_writer import SheetsWriter
 from src import config
 from src import logger
 
@@ -42,7 +43,7 @@ async def test_parser_engine():
         log.info("\n3. Переход на страницу Pipiads...")
         success = await browser_manager.navigate_with_retry(
             config.PIPIADS_INITIAL_URL,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             timeout=30000
         )
         if not success:
@@ -88,8 +89,21 @@ async def test_parser_engine():
             first_product = products[0]
             log.info(f"\n7. Тест: получение деталей товара '{first_product.get('name', 'N/A')[:50]}...'")
             
+            # 7.1. Подключение к Google Sheets (до получения данных товара)
+            log.info("\n7.1. Подключение к Google Sheets...")
+            sheets_writer = None
             try:
-                product_data = await parser.get_product_details(first_product['url'])
+                sheets_writer = SheetsWriter()
+                if sheets_writer.connect():
+                    log.info("✅ Подключение к Google Sheets успешно")
+                else:
+                    log.warning("⚠️ Не удалось подключиться к Google Sheets, продолжаем без записи")
+            except Exception as e:
+                log.warning(f"⚠️ Ошибка при подключении к Google Sheets: {e}, продолжаем без записи")
+            
+            try:
+                # Передаем sheets_writer в get_product_details - базовые данные запишутся сразу
+                product_data = await parser.get_product_details(first_product['url'], sheets_writer=sheets_writer)
                 
                 log.info(f"\n✅ Данные товара:")
                 log.info(f"  Название: {product_data.product_name}")
@@ -111,6 +125,39 @@ async def test_parser_engine():
                         log.info(f"    First seen: {video.get('first_seen', 'N/A')}")
                 else:
                     log.warning("⚠️ Видео не найдены")
+                
+                # 9. Запись данных о видео в Google Sheets (базовые данные уже записаны)
+                if sheets_writer:
+                    log.info("\n9. Запись данных о видео в Google Sheets...")
+                    try:
+                        # Получаем номер строки из product_data (был сохранен при записи базовых данных)
+                        row_number = getattr(product_data, '_sheets_row', 0)
+                        if row_number <= 0:
+                            # Если номер строки не сохранен, находим пустую строку
+                            row_number = sheets_writer.find_next_empty_row()
+                            log.warning(f"⚠️ Номер строки не найден, используем строку {row_number}")
+                        
+                        # Преобразуем ProductData в словарь
+                        product_dict = {
+                            "product_name": product_data.product_name,
+                            "category": product_data.category,
+                            "pipiads_link": product_data.pipiads_link,
+                            "videos": product_data.videos,
+                        }
+                        
+                        # Записываем данные (включая базовые, если ячейки не защищены)
+                        # Пробуем записать базовые данные, если они не были записаны ранее
+                        update_basic = (row_number > 0 and getattr(product_data, '_sheets_row', 0) == 0)
+                        success = sheets_writer.write_product_data(row_number, product_dict, update_basic=update_basic)
+                        if success:
+                            log.info(f"✅ Данные о видео записаны в Google Sheets (строка {row_number})")
+                        else:
+                            log.error("❌ Ошибка при записи данных о видео в Google Sheets")
+                    except Exception as e:
+                        log.error(f"❌ Ошибка при записи данных о видео: {e}")
+                        import traceback
+                        log.error(traceback.format_exc())
+                    
             except Exception as e:
                 log.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА при получении деталей товара: {e}")
                 import traceback
