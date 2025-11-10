@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import config
 from . import logger
+from . import validator
 
 log = logger.get_logger("SheetsWriter")
 
@@ -237,10 +238,13 @@ class SheetsWriter:
                 tiktok_link = video.get("tiktok_link", "N/A")
                 values[config.SHEET_COLUMNS[f"{video_prefix}tiktok"]] = tiktok_link
                 
-                # Impression
-                impression = video.get("impression", 0)
-                if isinstance(impression, (int, float)) and impression > 0:
-                    values[config.SHEET_COLUMNS[f"{video_prefix}impression"]] = int(impression)
+                # Impression (может быть строкой "170.6K" или числом)
+                impression = video.get("impression", "N/A")
+                if isinstance(impression, str) and impression != "N/A":
+                    values[config.SHEET_COLUMNS[f"{video_prefix}impression"]] = impression
+                elif isinstance(impression, (int, float)) and impression > 0:
+                    # Форматируем число в формат "170.6K"
+                    values[config.SHEET_COLUMNS[f"{video_prefix}impression"]] = validator.format_impressions(int(impression))
                 else:
                     values[config.SHEET_COLUMNS[f"{video_prefix}impression"]] = "N/A"
                 

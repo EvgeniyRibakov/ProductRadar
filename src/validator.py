@@ -199,5 +199,41 @@ def format_audience(age: Optional[str], platform: Optional[str] = None) -> str:
     return result if result else "N/A"
 
 
+def format_impressions(impressions: Optional[int]) -> str:
+    """
+    Форматирует число impressions в формат "170.6K" или "339.9M"
+    
+    Args:
+        impressions: Число impressions
+    
+    Returns:
+        Отформатированная строка (например "170.6K", "339.9M") или "N/A"
+    """
+    if impressions is None or impressions <= 0:
+        return "N/A"
+    
+    # Если >= 1 миллион, форматируем как M
+    if impressions >= 1_000_000:
+        millions = impressions / 1_000_000
+        # Округляем до 1 знака после запятой
+        if millions >= 100:
+            return f"{int(millions)}M"
+        else:
+            return f"{millions:.1f}M".rstrip('0').rstrip('.')
+    
+    # Если >= 1 тысяча, форматируем как K
+    elif impressions >= 1_000:
+        thousands = impressions / 1_000
+        # Округляем до 1 знака после запятой
+        if thousands >= 100:
+            return f"{int(thousands)}K"
+        else:
+            return f"{thousands:.1f}K".rstrip('0').rstrip('.')
+    
+    # Меньше 1000 - просто число
+    else:
+        return str(impressions)
+
+
 
 

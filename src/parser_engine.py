@@ -1115,10 +1115,17 @@ class ParserEngine:
         filtered = []
         
         for video in videos:
-            # Проверка impression
+            # Проверка impression (может быть строкой "170.6K" или числом)
             impression = video.get("impression", 0)
-            if not validator.validate_impressions(impression, config.MIN_IMPRESSIONS):
-                log.debug(f"Видео пропущено: impression {impression} < {config.MIN_IMPRESSIONS}")
+            impression_num = 0
+            if isinstance(impression, str):
+                # Парсим строку в число для сравнения
+                impression_num = validator.parse_impressions(impression) or 0
+            elif isinstance(impression, (int, float)):
+                impression_num = int(impression)
+            
+            if not validator.validate_impressions(impression_num, config.MIN_IMPRESSIONS):
+                log.debug(f"Видео пропущено: impression {impression} ({impression_num}) < {config.MIN_IMPRESSIONS}")
                 continue
             
             # Проверка даты (если есть)
@@ -1143,16 +1150,37 @@ class ParserEngine:
                 log.debug("Видео пропущено: нет даты first_seen и impression < минимума")
                 continue
             
+            # Сохраняем числовое значение для сортировки
+            video["_impression_num"] = impression_num
             filtered.append(video)
         
-        # Сортировка по приоритету: сначала >= 100k, потом >= 50k
-        filtered.sort(key=lambda v: (
-            0 if v.get("impression", 0) >= config.PRIORITY_IMPRESSIONS else 1,
-            -v.get("impression", 0)  # По убыванию impression
-        ))
+        # Сортировка: сначала по дате (самые недавние), потом по impressions (самые большие)
+        # Убираем дубликаты по tiktok_link или ad_search_url
+        seen_videos = set()
+        unique_videos = []
+        for video in filtered:
+            # Используем tiktok_link или ad_search_url для определения уникальности
+            video_id = video.get("tiktok_link") or video.get("ad_search_url") or str(video.get("impression", ""))
+            if video_id not in seen_videos:
+                seen_videos.add(video_id)
+                unique_videos.append(video)
         
-        log.info(f"✅ Отфильтровано {len(filtered)} видео из {len(videos)}")
-        return filtered
+        # Сортируем: сначала по дате (самые недавние), потом по impressions (самые большие)
+        def sort_key(v):
+            parsed_date = validator.parse_video_date(v.get("first_seen", ""))
+            if parsed_date:
+                date_timestamp = -parsed_date.timestamp()  # Отрицательное для сортировки по убыванию (самые недавние)
+            else:
+                date_timestamp = 0  # Видео без даты в конец
+            return (date_timestamp, -v.get("_impression_num", 0))
+        
+        unique_videos.sort(key=sort_key)
+        
+        # Берем топ-3
+        top_videos = unique_videos[:3]
+        
+        log.info(f"✅ Отфильтровано {len(filtered)} видео из {len(videos)}, уникальных: {len(unique_videos)}, топ-3: {len(top_videos)}")
+        return top_videos
     
     async def _get_video_details(self, video: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -1307,12 +1335,21 @@ class ParserEngine:
                 log.warning("      ⚠️ TikTok ссылка не найдена")
             
             # 2. Impressions - КРИТИЧНО: "Impressions" (англ.) или "Показы" (рус.), не "Likes" или "Нравится"!
+            # Ищем в разделе "Data/Данные" в пункте "Impression/Показ"
             log.info("      → Извлечение impressions...")
             impression_text = await self._extract_impressions()
             if impression_text:
-                video_data["impression"] = validator.parse_impressions(impression_text) or 0
-                log.info(f"      ✅ Impressions: {video_data['impression']}")
+                # Сохраняем оригинальный формат (если он уже в формате "170.6K" или "339.9M")
+                if impression_text.upper().endswith(('K', 'M')):
+                    video_data["impression"] = impression_text
+                    log.info(f"      ✅ Impressions (оригинальный формат): {impression_text}")
+                else:
+                    # Парсим число и форматируем обратно
+                    impression_num = validator.parse_impressions(impression_text) or 0
+                    video_data["impression"] = validator.format_impressions(impression_num)
+                    log.info(f"      ✅ Impressions (сформатировано): {video_data['impression']}")
             else:
+                video_data["impression"] = "N/A"
                 log.warning("      ⚠️ Impressions не найдены")
             
             # 3. Script (из "Transcript" или "Анализ транскрипта")
@@ -1325,30 +1362,46 @@ class ParserEngine:
                 video_data["script"] = "N/A"
                 log.info("      ⚠️ Script не найден, установлено 'N/A'")
             
-            # 4. Hook (из секции Hook)
+            # 4. Hook (из секции Hook или Hooks)
             log.info("      → Извлечение hook...")
             hook = await self._extract_hook()
+            if not hook:
+                # Повторный поиск, если не найден
+                log.info("      → Hook не найден, повторный поиск...")
+                hook = await self._extract_hook()
+            
             if hook:
                 video_data["hook"] = hook
                 log.info(f"      ✅ Hook найден: {hook[:50]}...")
             else:
                 video_data["hook"] = "N/A"
-                log.info("      ⚠️ Hook не найден, установлено 'N/A'")
+                log.info("      ⚠️ Hook не найден после повторного поиска, установлено 'N/A'")
             
-            # 5. Audience Age и Country (из Target Audience или Целевая аудитория)
+            # 5. Audience Age (из поля Audience/Аудитория)
             log.info("      → Извлечение данных аудитории...")
             audience_data = await self._extract_audience()
             if audience_data:
                 age = audience_data.get("age", "N/A")
                 platform = audience_data.get("platform", "N/A")
-                # Форматируем в формате "35-45 Android"
-                video_data["audience_age"] = validator.format_audience(age, platform)
-                video_data["country"] = audience_data.get("country", "N/A")
-                log.info(f"      ✅ Audience: {video_data['audience_age']}, Country: {video_data['country']}")
+                # Форматируем в формате "35-45" или "35-45 Android" (если есть платформа)
+                # В строке 6 только возраст "25-35", без платформы
+                video_data["audience_age"] = age if age != "N/A" else "N/A"
+                log.info(f"      ✅ Audience: {video_data['audience_age']}")
             else:
+                video_data["audience_age"] = "N/A"
                 log.info("      ⚠️ Данные аудитории не найдены, установлено 'N/A'")
             
-            # 6. First seen (формат "Oct 27 2025")
+            # 6. Country (из поля "Country/Region" или "Страна/регион" - ОТДЕЛЬНО от Audience!)
+            log.info("      → Извлечение страны...")
+            country = await self._extract_country()
+            if country:
+                video_data["country"] = country
+                log.info(f"      ✅ Country: {country}")
+            else:
+                video_data["country"] = "N/A"
+                log.info("      ⚠️ Country не найден, установлено 'N/A'")
+            
+            # 7. First seen (формат "Oct 27 2025" - извлекаем только первую дату из "Oct 28 2025 ~ Nov 10 2025")
             log.info("      → Извлечение даты First seen...")
             first_seen = await self._extract_first_seen()
             if first_seen:
@@ -1367,41 +1420,64 @@ class ParserEngine:
     
     async def _extract_impressions(self) -> Optional[str]:
         """
-        Извлечь impressions - КРИТИЧНО: "Impressions" (англ.) или "Показы" (рус.), не "Likes" или "Нравится"!
+        Извлечь impressions - КРИТИЧНО: в разделе "Data/Данные" в пункте "Impression/Показ"
         
         Returns:
-            Строка с impressions или None
+            Строка с impressions (например "170.6K", "339.9M") или None
         """
         try:
-            # Ищем по тексту "Impressions" или "Показы" - это ключевое слово
+            # Ищем раздел "Data" или "Данные"
+            data_keywords = ["Data", "Данные"]
+            
+            for keyword in data_keywords:
+                try:
+                    # Ищем элемент с текстом "Data" или "Данные"
+                    data_locator = self.page.locator(f'text=/{keyword}/i').first
+                    if await data_locator.count() > 0:
+                        # Ищем "Impression" или "Показ" в этом разделе
+                        impression_keywords = ["Impression", "Показ", "Показы"]
+                        for imp_keyword in impression_keywords:
+                            try:
+                                # Ищем элемент с текстом "Impression" или "Показ" рядом с "Data"
+                                parent_text = await data_locator.locator("..").inner_text()
+                                if imp_keyword in parent_text:
+                                    # Ищем число в формате "83.1M", "170.6K" и т.д.
+                                    pattern = rf'{imp_keyword}[:\s]*([\d.,]+[KM]?)'
+                                    match = re.search(pattern, parent_text, re.IGNORECASE)
+                                    if match:
+                                        impression_str = match.group(1)
+                                        log.debug(f"Найдено impressions в разделе Data: {impression_str}")
+                                        return impression_str
+                            except:
+                                continue
+                except:
+                    continue
+            
+            # Fallback: ищем напрямую "Impression" или "Показы" (не "Likes"!)
+            impression_keywords = ["Impression", "Показ", "Показы"]
             page_text = await self.page.content()
             
-            # Паттерн для поиска "Impressions" или "Показы" с числом рядом (приоритет английскому)
-            patterns = [
-                r'Impression[:\s]+([\d.,]+[KM]?)',  # Английский приоритет
-                r'Impression[:\s]+([\d\s]+[KM]?)',
-                r'([\d.,]+[KM]?)\s*Impression',
-                r'Показы[:\s]*([\d.,]+[KM]?)',  # Русский fallback
-                r'Показы[:\s]*([\d\s]+[KM]?)',
-            ]
+            for keyword in impression_keywords:
+                # Паттерн для поиска с числом (приоритет английскому)
+                patterns = [
+                    rf'{keyword}[:\s]+([\d.,]+[KM]?)',
+                    rf'([\d.,]+[KM]?)\s*{keyword}',
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        impression_str = match.group(1)
+                        log.debug(f"Найдено impressions: {impression_str}")
+                        return impression_str
             
-            for pattern in patterns:
-                match = re.search(pattern, page_text, re.IGNORECASE)
-                if match:
-                    impression_str = match.group(1)
-                    log.debug(f"Найдено impressions: {impression_str}")
-                    return impression_str
-            
-            # Если не нашли по паттерну, ищем элемент с текстом "Impressions" или "Показы"
+            # Если не нашли по паттерну, ищем элемент с текстом
             try:
-                # Сначала английский
-                impression_locator = self.page.locator('text=/Impressions/i').first
+                impression_locator = self.page.locator('text=/Impression/i').first
                 if await impression_locator.count() == 0:
-                    # Fallback на русский
-                    impression_locator = self.page.locator('text=/Показы/i').first
+                    impression_locator = self.page.locator('text=/Показ/i').first
                 
                 if await impression_locator.count() > 0:
-                    # Ищем число рядом с этим элементом - используем locator для родителя
                     parent_text = await impression_locator.locator("..").inner_text()
                     match = re.search(r'([\d.,]+[KM]?)', parent_text)
                     if match:
@@ -1409,7 +1485,7 @@ class ParserEngine:
             except:
                 pass
             
-            log.warning("Не удалось найти 'Impressions' или 'Показы'")
+            log.warning("Не удалось найти 'Impression' или 'Показ' в разделе Data")
             return None
             
         except Exception as e:
@@ -1417,12 +1493,12 @@ class ParserEngine:
             return None
     
     async def _extract_script(self) -> Optional[str]:
-        """Извлечь сценарий из секции 'Transcript' или 'Анализ транскрипта'"""
+        """Извлечь сценарий из секции 'Script' или 'Сценарий' (или 'Transcript' или 'Анализ транскрипта')"""
         try:
             # Метод 1: Поиск через локаторы (английский и русский)
-            transcript_keywords = ["Transcript", "Анализ транскрипта", "Транскрипт"]
+            script_keywords = ["Script", "Сценарий", "Transcript", "Анализ транскрипта", "Транскрипт"]
             
-            for keyword in transcript_keywords:
+            for keyword in script_keywords:
                 try:
                     # Ищем элемент с текстом
                     locator = self.page.locator(f'text=/{keyword}/i').first
@@ -1463,7 +1539,7 @@ class ParserEngine:
             try:
                 script = await self.page.evaluate("""
                     () => {
-                        const keywords = ['Transcript', 'Анализ транскрипта', 'Транскрипт'];
+                        const keywords = ['Script', 'Сценарий', 'Transcript', 'Анализ транскрипта', 'Транскрипт'];
                         const stopWords = ['Hook', 'Хук', 'Target Audience', 'Целевая аудитория', 
                                           'First seen', 'Впервые замечено', 'Impressions', 'Показы'];
                         
@@ -1511,10 +1587,10 @@ class ParserEngine:
             return None
     
     async def _extract_hook(self) -> Optional[str]:
-        """Извлечь hook из секции Hook (англ.) или Хук (рус.)"""
+        """Извлечь hook из секции Hook/Hooks (англ.) или Хук/Хуки (рус.)"""
         try:
             # Метод 1: Поиск через локаторы
-            hook_keywords = ["Hook", "Хук"]
+            hook_keywords = ["Hooks", "Hook", "Хуки", "Хук"]
             
             for keyword in hook_keywords:
                 try:
@@ -1556,7 +1632,7 @@ class ParserEngine:
             try:
                 hook = await self.page.evaluate("""
                     () => {
-                        const keywords = ['Hook', 'Хук'];
+                        const keywords = ['Hooks', 'Hook', 'Хуки', 'Хук'];
                         const stopWords = ['Target Audience', 'Целевая аудитория', 'First seen', 'Впервые замечено', 
                                          'Transcript', 'Анализ транскрипта', 'Impressions', 'Показы'];
                         
@@ -1601,12 +1677,12 @@ class ParserEngine:
             return None
     
     async def _extract_audience(self) -> Optional[Dict[str, str]]:
-        """Извлечь возраст, платформу и страну из Target Audience"""
+        """Извлечь возраст и платформу из поля Audience/Аудитория в формате 'Аудитория: Возраст: 25-35 | Устройство: Android'"""
         try:
-            audience_data = {"age": "N/A", "platform": "N/A", "country": "N/A"}
+            audience_data = {"age": "N/A", "platform": "N/A"}
             
             # Метод 1: Поиск через локаторы
-            audience_keywords = ["Target Audience", "Целевая аудитория", "Audience", "Аудитория"]
+            audience_keywords = ["Audience", "Аудитория", "Target Audience", "Целевая аудитория"]
             
             for keyword in audience_keywords:
                 try:
@@ -1615,31 +1691,38 @@ class ParserEngine:
                         # Ищем текст аудитории рядом
                         text = await locator.locator("..").inner_text()
                         
-                        # Ищем возраст (формат "35-45", "18-24" и т.д.)
-                        age_match = re.search(r'(\d{1,2}-\d{1,2})', text)
-                        if age_match:
-                            audience_data["age"] = age_match.group(1)
+                        # Ищем возраст в формате "Возраст: 25-35" или просто "25-35"
+                        age_patterns = [
+                            r'Возраст[:\s]+(\d{1,2}-\d{1,2})',
+                            r'Age[:\s]+(\d{1,2}-\d{1,2})',
+                            r'(\d{1,2}-\d{1,2})',  # Просто возраст
+                        ]
                         
-                        # Ищем платформу
-                        platform_keywords = ["Android", "iOS", "iPhone", "iPad"]
-                        for platform_keyword in platform_keywords:
-                            if platform_keyword in text:
-                                if platform_keyword in ["iOS", "iPhone", "iPad"]:
+                        for pattern in age_patterns:
+                            age_match = re.search(pattern, text, re.IGNORECASE)
+                            if age_match:
+                                audience_data["age"] = age_match.group(1)
+                                break
+                        
+                        # Ищем платформу в формате "Устройство: Android" или "| Android"
+                        platform_patterns = [
+                            r'Устройство[:\s]+(Android|iOS)',
+                            r'Device[:\s]+(Android|iOS)',
+                            r'\|\s*(Android|iOS)',
+                            r'(Android|iOS)',
+                        ]
+                        
+                        for pattern in platform_patterns:
+                            platform_match = re.search(pattern, text, re.IGNORECASE)
+                            if platform_match:
+                                platform = platform_match.group(1)
+                                if platform.lower() in ["ios", "iphone", "ipad"]:
                                     audience_data["platform"] = "iOS"
                                 else:
                                     audience_data["platform"] = "Android"
                                 break
                         
-                        # Ищем страну (расширенный список)
-                        country_keywords = ["USA", "US", "United States", "Россия", "Russia", "Philippines", 
-                                          "Филиппины", "China", "Китай", "India", "Индия", "Brazil", "Бразилия",
-                                          "Germany", "Германия", "France", "Франция", "UK", "United Kingdom"]
-                        for country_keyword in country_keywords:
-                            if country_keyword in text:
-                                audience_data["country"] = country_keyword
-                                break
-                        
-                        if audience_data["age"] != "N/A" or audience_data["platform"] != "N/A" or audience_data["country"] != "N/A":
+                        if audience_data["age"] != "N/A" or audience_data["platform"] != "N/A":
                             return audience_data
                 except:
                     continue
@@ -1705,11 +1788,101 @@ class ParserEngine:
             log.debug(f"Ошибка при извлечении аудитории: {e}")
             return None
     
+    async def _extract_country(self) -> Optional[str]:
+        """Извлечь страну из поля 'Country/Region' или 'Страна/регион' (ОТДЕЛЬНО от Audience!)"""
+        try:
+            country_keywords = ["Country/Region", "Страна/регион", "Country", "Страна", "Region", "Регион"]
+            
+            for keyword in country_keywords:
+                try:
+                    locator = self.page.locator(f'text=/{keyword}/i').first
+                    if await locator.count() > 0:
+                        # Ищем текст страны рядом
+                        text = await locator.locator("..").inner_text()
+                        
+                        # Ищем страну (расширенный список)
+                        country_patterns = [
+                            r'United States(?:\([0-9]+\))?',  # United States(1)
+                            r'USA(?:\([0-9]+\))?',
+                            r'US(?:\([0-9]+\))?',
+                            r'Philippines(?:\([0-9]+\))?',
+                            r'Филиппины(?:\([0-9]+\))?',
+                            r'Russia(?:\([0-9]+\))?',
+                            r'Россия(?:\([0-9]+\))?',
+                            r'China(?:\([0-9]+\))?',
+                            r'Китай(?:\([0-9]+\))?',
+                            r'India(?:\([0-9]+\))?',
+                            r'Индия(?:\([0-9]+\))?',
+                            r'Brazil(?:\([0-9]+\))?',
+                            r'Бразилия(?:\([0-9]+\))?',
+                            r'Germany(?:\([0-9]+\))?',
+                            r'Германия(?:\([0-9]+\))?',
+                            r'France(?:\([0-9]+\))?',
+                            r'Франция(?:\([0-9]+\))?',
+                            r'UK(?:\([0-9]+\))?',
+                            r'United Kingdom(?:\([0-9]+\))?',
+                        ]
+                        
+                        for pattern in country_patterns:
+                            match = re.search(pattern, text, re.IGNORECASE)
+                            if match:
+                                country = match.group(0)
+                                # Убираем (1) и т.д.
+                                country = re.sub(r'\([0-9]+\)', '', country).strip()
+                                log.debug(f"Country найден через '{keyword}': {country}")
+                                return country
+                except:
+                    continue
+            
+            # Метод 2: Поиск через JavaScript
+            try:
+                country = await self.page.evaluate("""
+                    () => {
+                        const keywords = ['Country/Region', 'Страна/регион', 'Country', 'Страна'];
+                        const countryPatterns = [
+                            /United States(?:\\([0-9]+\\))?/i,
+                            /USA(?:\\([0-9]+\\))?/i,
+                            /Philippines(?:\\([0-9]+\\))?/i,
+                            /Russia(?:\\([0-9]+\\))?/i,
+                            /China(?:\\([0-9]+\\))?/i,
+                            /India(?:\\([0-9]+\\))?/i
+                        ];
+                        
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            const text = el.innerText || '';
+                            
+                            for (const keyword of keywords) {
+                                if (text.includes(keyword)) {
+                                    for (const pattern of countryPatterns) {
+                                        const match = text.match(pattern);
+                                        if (match) {
+                                            return match[0].replace(/\\([0-9]+\\)/g, '').trim();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if country:
+                    log.debug(f"Country найден через JavaScript: {country}")
+                    return country.strip()
+            except Exception as e:
+                log.debug(f"Ошибка при поиске country через JS: {e}")
+            
+            return None
+            
+        except Exception as e:
+            log.debug(f"Ошибка при извлечении country: {e}")
+            return None
+    
     async def _extract_first_seen(self) -> Optional[str]:
-        """Извлечь First seen в формате 'Oct 27 2025' (англ.) или 'Впервые замечено' (рус.)"""
+        """Извлечь First seen в формате 'Oct 27 2025' - только первую дату из 'Oct 28 2025 ~ Nov 10 2025'"""
         try:
             # Метод 1: Поиск через локаторы
-            first_seen_keywords = ["First seen", "Впервые замечено", "First Seen"]
+            first_seen_keywords = ["First seen - Last seen", "First seen", "Впервые замечено", "First Seen"]
             
             for keyword in first_seen_keywords:
                 try:
@@ -1719,6 +1892,7 @@ class ParserEngine:
                         text = await locator.locator("..").inner_text()
                         
                         # Ищем дату в формате "Oct 27 2025" или "Oct 27, 2025"
+                        # Ищем первую дату из диапазона "Oct 28 2025 ~ Nov 10 2025"
                         date_patterns = [
                             r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})',  # Oct 27 2025
                             r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})',  # Oct 27, 2025
@@ -1726,6 +1900,7 @@ class ParserEngine:
                         ]
                         
                         for pattern in date_patterns:
+                            # Ищем первую дату (до ~ или конца строки)
                             date_match = re.search(pattern, text)
                             if date_match:
                                 date_str = date_match.group(1)
@@ -1738,8 +1913,10 @@ class ParserEngine:
                         if keyword in text:
                             parts = text.split(keyword, 1)
                             if len(parts) > 1:
+                                # Берем только до ~ (если есть диапазон)
+                                after_keyword = parts[1].split('~')[0].strip()
                                 for pattern in date_patterns:
-                                    date_match = re.search(pattern, parts[1])
+                                    date_match = re.search(pattern, after_keyword)
                                     if date_match:
                                         date_str = date_match.group(1).replace(',', '').strip()
                                         log.debug(f"First seen найден после '{keyword}': {date_str}")
@@ -1751,7 +1928,7 @@ class ParserEngine:
             try:
                 first_seen = await self.page.evaluate("""
                     () => {
-                        const keywords = ['First seen', 'Впервые замечено', 'First Seen'];
+                        const keywords = ['First seen - Last seen', 'First seen', 'Впервые замечено', 'First Seen'];
                         const datePatterns = [
                             /([A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{4})/,  // Oct 27 2025
                             /([A-Z][a-z]{2}\\s+\\d{1,2},\\s+\\d{4})/,  // Oct 27, 2025
@@ -1766,7 +1943,12 @@ class ParserEngine:
                                 if (text.includes(keyword)) {
                                     // Ищем дату после ключевого слова
                                     const index = text.indexOf(keyword);
-                                    const afterKeyword = text.substring(index + keyword.length);
+                                    let afterKeyword = text.substring(index + keyword.length);
+                                    
+                                    // Берем только до ~ (если есть диапазон)
+                                    if (afterKeyword.includes('~')) {
+                                        afterKeyword = afterKeyword.split('~')[0];
+                                    }
                                     
                                     for (const pattern of datePatterns) {
                                         const match = afterKeyword.match(pattern);
@@ -1775,12 +1957,10 @@ class ParserEngine:
                                         }
                                     }
                                     
-                                    // Ищем дату в тексте элемента
-                                    for (const pattern of datePatterns) {
-                                        const match = text.match(pattern);
-                                        if (match) {
-                                            return match[1].replace(',', '').trim();
-                                        }
+                                    // Ищем дату в тексте элемента (тоже только первую)
+                                    const firstDate = text.match(datePatterns[0]);
+                                    if (firstDate) {
+                                        return firstDate[1].replace(',', '').trim();
                                     }
                                 }
                             }

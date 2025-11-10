@@ -1,0 +1,403 @@
+export async function main(wf: IWorkflow) {
+  try {
+    const { googleSheetId, pipiadsEmail, pipiadsPassword, productIndex, minImpressions } = await wf.getAutomationParameters();
+    const client = await wf.getAirtopClient();
+    const session = await wf.getAirtopSession();
+    const window = await wf.getAirtopWindow();
+
+    await wf.log({ label: "Init", message: `Starting Pipiads data collection for product index ${productIndex}` });
+
+    // Get current date for filtering
+    const today = new Date();
+    const fourteenDaysAgo = new Date(today);
+    fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+
+    await wf.log({ label: "Date Range", message: `Today: ${today.toDateString()}, 14 days ago: ${fourteenDaysAgo.toDateString()}` });
+
+    const pipiadsSearchUrl = "https://www.pipiads.com/ru/tiktok-shop-product?time=7&categorize=601595,601733,873480,601613,601615,601616,601619,601602,601608,601609,601611,601610,601646,873736,601506,601511,2169232,978056,601490,601493,601492,601495,601494,601498,1003784,873864,873608,601686,601565,1004808,601627,601681,601644,601513,601516,981512,601469,806160,700789,1004168,601582,601585,601587,601586,601588,853264,601558,601560,601550,601552,601554,601556,601555,601529,201534,853520,601618,875144,601462,601461,601463,601737,874888&search_type=1&sales_trend=1&current_page=1&page_size=20&sort=5&sort_type=desc";
+
+    await wf.log({ label: "Navigate", message: "Loading Pipiads search page" });
+    await window.loadUrl(pipiadsSearchUrl);
+    await window.waitForPage();
+
+    await wf.log({ label: "Check Login", message: "Checking if user is signed in" });
+    const signInCheckResponse = await window.pageQuery(
+      "Is the user currently signed in to Pipiads? Look for user profile, logout button, or login form",
+      {
+        configuration: {
+          outputSchema: {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            type: "object",
+            properties: {
+              isSignedIn: { type: "boolean" },
+              indicators: { type: "string" }
+            },
+            required: ["isSignedIn"],
+            additionalProperties: false
+          }
+        }
+      }
+    );
+
+    const signInStatus = JSON.parse(signInCheckResponse.data.modelResponse);
+    await wf.log({ label: "Sign In Status", message: `User signed in: ${signInStatus.isSignedIn}`, withData: signInStatus });
+
+    if (!signInStatus.isSignedIn) {
+      await wf.log({ label: "Sign In", message: "Logging in to Pipiads account" });
+      await window.type(pipiadsEmail, { elementDescription: "email input field" });
+      await window.type(pipiadsPassword, { elementDescription: "password input field" });
+      await window.click("login button");
+      await window.waitForPage();
+
+      await wf.log({ label: "Verify Login", message: "Verifying login was successful" });
+      const loginVerifyResponse = await window.pageQuery(
+        "Is the user now signed in? Look for user profile or confirmation that login succeeded",
+        {
+          configuration: {
+            outputSchema: {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              type: "object",
+              properties: {
+                isSignedIn: { type: "boolean" }
+              },
+              required: ["isSignedIn"],
+              additionalProperties: false
+            }
+          }
+        }
+      );
+
+      const loginVerify = JSON.parse(loginVerifyResponse.data.modelResponse);
+      if (!loginVerify.isSignedIn) {
+        await wf.log({ label: "Login Failed", message: "Unable to log in to Pipiads" });
+        wf.halt({
+          status: "failure",
+          resultMessage: "Unable to log in to Pipiads. Please verify your credentials and try again."
+        });
+        return;
+      }
+      await wf.log({ label: "Login Success", message: "Successfully logged in to Pipiads" });
+    }
+
+    await wf.log({ label: "Extract Products", message: "Getting all products from search page" });
+    const productsResponse = await window.pageQuery(
+      "Extract all products visible on this page. For each product, get: product name, category, and the full product URL/link. Return as JSON with structure: {products: [{name, category, url}]}",
+      {
+        configuration: {
+          outputSchema: {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            type: "object",
+            properties: {
+              products: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    category: { type: "string" },
+                    url: { type: "string" }
+                  },
+                  additionalProperties: false
+                }
+              }
+            },
+            required: ["products"],
+            additionalProperties: false
+          }
+        }
+      }
+    );
+
+    const products = JSON.parse(productsResponse.data.modelResponse).products;
+    await wf.log({ label: "Products Found", message: `Found ${products.length} products on page`, withData: products });
+
+    if (products.length < productIndex) {
+      await wf.log({ label: "Error", message: `Only ${products.length} products found, need at least ${productIndex}` });
+      wf.halt({
+        status: "failure",
+        resultMessage: `Only found ${products.length} products. Need at least ${productIndex} products on the page.`
+      });
+      return;
+    }
+
+    const targetProduct = products[productIndex - 1];
+    await wf.log({ label: "Target Product", message: `Selected product #${productIndex}: ${targetProduct.name}` });
+
+    await wf.log({ label: "Load Product", message: "Loading product page" });
+    await window.loadUrl(targetProduct.url);
+    await window.waitForPage();
+
+    // Collect all videos from all pages
+    const allVideos: any[] = [];
+    let currentPage = 1;
+    const maxPages = 10; // Safety limit to prevent infinite loops
+
+    while (currentPage <= maxPages) {
+      await wf.log({ label: "Extract Videos", message: `Getting videos from page ${currentPage}` });
+
+      const videosResponse = await window.pageQuery(
+        "Find all TikTok video cards shown on this page. For each video, extract: 1) ad-search URL (link to ad details page), 2) Impression number (first large number with K or M suffix), 3) First seen date (in format like 'Oct 27 2025'). Return: {videos: [{adSearchUrl, impressions, firstSeen}]}",
+        {
+          configuration: {
+            outputSchema: {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              type: "object",
+              properties: {
+                videos: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      adSearchUrl: { type: "string" },
+                      impressions: { type: "string" },
+                      firstSeen: { type: "string" }
+                    },
+                    additionalProperties: false
+                  }
+                }
+              },
+              required: ["videos"],
+              additionalProperties: false
+            }
+          }
+        }
+      );
+
+      const pageVideos = JSON.parse(videosResponse.data.modelResponse).videos;
+      await wf.log({ label: "Page Videos", message: `Found ${pageVideos.length} videos on page ${currentPage}`, withData: pageVideos });
+
+      if (pageVideos.length === 0) {
+        await wf.log({ label: "No More Videos", message: "No more videos found, stopping pagination" });
+        break;
+      }
+
+      allVideos.push(...pageVideos);
+
+      // Try to go to next page
+      const nextPageClickResult = await window.click("next page button or arrow in pagination");
+      if (!nextPageClickResult) {
+        await wf.log({ label: "Last Page", message: "No next page button found, reached last page" });
+        break;
+      }
+
+      await window.waitForPage();
+      currentPage++;
+    }
+
+    await wf.log({ label: "All Videos", message: `Total videos collected: ${allVideos.length}`, withData: allVideos });
+
+    // Filter videos by date and impressions
+    const filteredVideos: any[] = [];
+    for (const video of allVideos) {
+      const dateStr = video.firstSeen;
+      const videoDate = parseDate(dateStr);
+
+      if (!videoDate) {
+        await wf.log({ label: "Date Parse", message: `Could not parse date: ${dateStr}` });
+        continue;
+      }
+
+      const impressionsNum = parseImpressions(video.impressions);
+
+      const meetsDateCriteria = videoDate >= fourteenDaysAgo;
+      const meetsImpressionsCriteria = impressionsNum >= minImpressions;
+
+      if (!meetsDateCriteria) {
+        await wf.log({ label: "Filter", message: `Video date ${dateStr} is older than 14 days, skipping` });
+        continue;
+      }
+
+      if (!meetsImpressionsCriteria) {
+        await wf.log({ label: "Filter", message: `Video impressions ${video.impressions} (${impressionsNum}) is less than ${minImpressions}, skipping` });
+        continue;
+      }
+
+      filteredVideos.push(video);
+    }
+
+    await wf.log({ label: "Filtered Videos", message: `After filtering: ${filteredVideos.length} videos match criteria`, withData: filteredVideos });
+
+    if (filteredVideos.length < 3) {
+      await wf.log({ label: "Error", message: `Only ${filteredVideos.length} videos meet criteria, need at least 3` });
+      wf.halt({
+        status: "failure",
+        resultMessage: `Product #${productIndex} has only ${filteredVideos.length} videos matching the criteria (first seen >= 14 days ago, impressions >= ${minImpressions}). Need at least 3 videos.`
+      });
+      return;
+    }
+
+    const selectedVideos = filteredVideos.slice(0, 3);
+    const productData = {
+      name: targetProduct.name,
+      category: targetProduct.category,
+      url: targetProduct.url,
+      videos: []
+    };
+
+    for (let videoIndex = 0; videoIndex < 3; videoIndex++) {
+      const video = selectedVideos[videoIndex];
+      await wf.log({ label: "Extract Video", message: `Processing video ${videoIndex + 1}/${selectedVideos.length}` });
+
+      await window.loadUrl(video.adSearchUrl);
+      await window.waitForPage();
+
+      const adDetailsResponse = await window.pageQuery(
+        "Extract from the ad details page: 1) TikTok Post link (under 'Пост TikTok'), 2) Impression number (labeled 'Показы' - the LARGE number, NOT small ones), 3) Script/Scenario (from Transcript Analysis section), 4) Hook (opening line from Hook section), 5) Audience Age (age range like 25-35), 6) Country/Region (country name), 7) First seen date (format like 'Oct 25 2025'). If field missing, use N/A. Return: {tiktokPostLink, impressions, script, hook, audienceAge, country, firstSeen}",
+        {
+          configuration: {
+            outputSchema: {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              type: "object",
+              properties: {
+                tiktokPostLink: { type: "string" },
+                impressions: { type: "string" },
+                script: { type: "string" },
+                hook: { type: "string" },
+                audienceAge: { type: "string" },
+                country: { type: "string" },
+                firstSeen: { type: "string" }
+              },
+              required: ["tiktokPostLink", "impressions"],
+              additionalProperties: false
+            }
+          }
+        }
+      );
+
+      const adDetails = JSON.parse(adDetailsResponse.data.modelResponse);
+      await wf.log({ label: "Ad Details", message: `Extracted details for video ${videoIndex + 1}`, withData: adDetails });
+
+      const videoData = {
+        tiktokPostLink: adDetails.tiktokPostLink,
+        impressions: adDetails.impressions,
+        script: adDetails.script || "N/A",
+        hook: adDetails.hook || "N/A",
+        audienceAge: adDetails.audienceAge || "N/A",
+        country: adDetails.country || "N/A",
+        firstSeen: adDetails.firstSeen || "N/A"
+      };
+
+      productData.videos.push(videoData);
+    }
+
+    // Get next empty row from Google Sheet
+    await wf.log({ label: "Read Sheet", message: "Reading Google Sheet to find next empty row" });
+    const sheetDataResponse = await session.service({
+      services: ["google-sheet"],
+      prompt: `Read all data from Google Sheet ID ${googleSheetId} on sheet named "шаблон выгрузуи 1.0". Return the highest row number that has data in column A, so we can insert the new product in the next row.`,
+      outputSchema: {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        type: "object",
+        properties: {
+          maxRowWithData: { type: "number" },
+          message: { type: "string" }
+        },
+        required: ["maxRowWithData", "message"],
+        additionalProperties: false
+      }
+    });
+
+    const sheetData = JSON.parse(sheetDataResponse.data.response);
+    const nextRowIndex = sheetData.maxRowWithData + 1;
+    await wf.log({ label: "Next Row", message: `Will write product #${productIndex} to row ${nextRowIndex}` });
+
+    await wf.log({ label: "Fill Sheet", message: `Filling Google Sheet row ${nextRowIndex} with product #${productIndex} data` });
+    await fillGoogleSheetRow(session, googleSheetId, nextRowIndex, productIndex, productData);
+
+    await wf.log({ label: "Complete", message: `Successfully collected and saved product #${productIndex} with 3 videos to row ${nextRowIndex}` });
+    wf.halt({
+      status: "success",
+      resultMessage: `Successfully extracted product #${productIndex} with 3 videos and filled Google Sheet row ${nextRowIndex}`
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    await wf.log({ label: "Error", message: "Automation failed with error", withError: errorMessage });
+    wf.halt({
+      status: "failure",
+      resultMessage: `Automation failed: ${errorMessage}`
+    });
+  }
+}
+
+function parseDate(dateStr: string): Date | null {
+  // Parse dates like "Oct 25 2025" or "Oct 25 2025-Oct 31 2025"
+  // Extract the first date from the string
+  const match = dateStr.match(/([A-Za-z]+)\s+(\d+)\s+(\d{4})/);
+  if (!match) return null;
+
+  const monthStr = match[1];
+  const day = parseInt(match[2], 10);
+  const year = parseInt(match[3], 10);
+
+  const months: Record<string, number> = {
+    'Jan': 0, 'Feb': 1, 'Mar': 2, 'Apr': 3, 'May': 4, 'Jun': 5,
+    'Jul': 6, 'Aug': 7, 'Sep': 8, 'Oct': 9, 'Nov': 10, 'Dec': 11
+  };
+
+  const monthIndex = months[monthStr];
+  if (monthIndex === undefined) return null;
+
+  return new Date(year, monthIndex, day);
+}
+
+function parseImpressions(impressionsStr: string): number {
+  // Parse impressions like "79.4M", "1.3M", "343.7K", "988"
+  const trimmed = impressionsStr.trim().toUpperCase();
+
+  if (trimmed.endsWith('M')) {
+    return Math.round(parseFloat(trimmed) * 1_000_000);
+  } else if (trimmed.endsWith('K')) {
+    return Math.round(parseFloat(trimmed) * 1_000);
+  } else {
+    return parseInt(trimmed, 10);
+  }
+}
+
+async function fillGoogleSheetRow(session: any, googleSheetId: string, rowIndex: number, productNumber: number, productData: any): Promise<void> {
+  const sheetName = "шаблон выгрузуи 1.0";
+
+  const rowData = {
+    "A": String(productNumber),
+    "B": productData.name,
+    "D": productData.category,
+    "E": productData.url,
+    "F": productData.videos[0]?.tiktokPostLink || "N/A",
+    "G": productData.videos[0]?.impressions || "N/A",
+    "H": productData.videos[0]?.script || "N/A",
+    "I": productData.videos[0]?.hook || "N/A",
+    "J": productData.videos[0]?.audienceAge || "N/A",
+    "K": productData.videos[0]?.country || "N/A",
+    "L": productData.videos[0]?.firstSeen || "N/A",
+    "M": productData.videos[1]?.tiktokPostLink || "N/A",
+    "N": productData.videos[1]?.impressions || "N/A",
+    "O": productData.videos[1]?.script || "N/A",
+    "P": productData.videos[1]?.hook || "N/A",
+    "Q": productData.videos[1]?.audienceAge || "N/A",
+    "R": productData.videos[1]?.country || "N/A",
+    "S": productData.videos[1]?.firstSeen || "N/A",
+    "T": productData.videos[2]?.tiktokPostLink || "N/A",
+    "U": productData.videos[2]?.impressions || "N/A",
+    "V": productData.videos[2]?.script || "N/A",
+    "W": productData.videos[2]?.hook || "N/A",
+    "X": productData.videos[2]?.audienceAge || "N/A",
+    "Y": productData.videos[2]?.country || "N/A",
+    "Z": productData.videos[2]?.firstSeen || "N/A"
+  };
+
+  const cellUpdates = Object.entries(rowData).map(([col, value]) => `${col}${rowIndex}: ${value}`).join(", ");
+
+  await session.service({
+    services: ["google-sheet"],
+    prompt: `Update Google Sheet ID ${googleSheetId} on sheet "${sheetName}". Fill row ${rowIndex} with the following data: ${cellUpdates}`,
+    outputSchema: {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      type: "object",
+      properties: {
+        success: { type: "boolean" },
+        message: { type: "string" }
+      },
+      required: ["success", "message"],
+      additionalProperties: false
+    }
+  });
+}
