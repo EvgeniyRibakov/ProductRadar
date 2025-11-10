@@ -356,7 +356,7 @@ class ParserEngine:
                     except:
                         continue
                 
-                # Метод 2: Поиск через JavaScript (более агрессивный)
+                # Метод 2: Поиск через JavaScript (более агрессивный - по структуре DOM)
                 if not product_data.product_name or len(product_data.product_name) <= 5:
                     try:
                         product_name = await self.page.evaluate("""
@@ -375,6 +375,57 @@ class ParserEngine:
                                 for (const el of productElements) {
                                     const text = el.innerText.trim();
                                     if (text && text.length > 5) {
+                                        return text;
+                                    }
+                                }
+                                
+                                // Ищем самый большой заголовок на странице (обычно это название товара)
+                                // НО пропускаем короткие тексты типа "Ad Analysis"
+                                const headings = document.querySelectorAll('h1, h2, h3');
+                                let maxLength = 0;
+                                let bestHeading = null;
+                                for (const h of headings) {
+                                    const text = h.innerText.trim();
+                                    const skipWords = ['tiktok', 'shop', 'product', 'detail', 'category', 'commission', 
+                                                      'остаток', 'remain', 'stock', 'ad analysis', 'analysis', 
+                                                      'limited time', 'promotion', 'annual plan'];
+                                    const textLower = text.toLowerCase();
+                                    // Пропускаем короткие тексты (меньше 20 символов) - это обычно не название товара
+                                    if (!skipWords.some(word => textLower.includes(word)) && 
+                                        text.length > maxLength && text.length > 20) {
+                                        maxLength = text.length;
+                                        bestHeading = text;
+                                    }
+                                }
+                                if (bestHeading) {
+                                    return bestHeading;
+                                }
+                                
+                                // Ищем в текстовых блоках - название товара обычно длинное
+                                // Например: "[BUY 1 TAKE 11] SHEEureka Scrub Facial Cleanser..."
+                                // НО исключаем футер/меню
+                                const footerMenuKeywords = ['Privacy', 'Terms', 'Copyright', 'PIPIADS', 'All Rights Reserved',
+                                                           'AI-agent', 'cosmobeauty', 'credits', 'subscription', 'invoice',
+                                                           'Monthly Credits', 'Extra Credits', 'data cost', 'detail costs',
+                                                           'Team Setting', 'Affiliate Dashboard', 'Logout', '@gmail.com',
+                                                           'English', 'Français', 'Deutsch', 'Español', 'Português'];
+                                const textBlocks = document.querySelectorAll('p, div, span');
+                                for (const block of textBlocks) {
+                                    const text = block.innerText.trim();
+                                    // Проверяем, что это не футер/меню
+                                    const isFooterMenu = footerMenuKeywords.some(keyword => text.includes(keyword));
+                                    if (isFooterMenu) continue;
+                                    
+                                    // Название товара обычно длинное (больше 30 символов) и содержит слова типа "Set", "Kit", "Mask" и т.д.
+                                    // Или начинается с "[" (например "[BUY 1 TAKE 11]")
+                                    if (text.length > 30 && text.length < 500 && 
+                                        !text.toLowerCase().includes('ad analysis') &&
+                                        !text.toLowerCase().includes('limited time') &&
+                                        !text.toLowerCase().includes('promotion') &&
+                                        !text.toLowerCase().includes('annual plan') &&
+                                        (text.startsWith('[') || text.includes('Set') || text.includes('Kit') || 
+                                         text.includes('Mask') || text.includes('Cleanser') || text.includes('Gift') ||
+                                         text.includes('Scrub') || text.includes('Facial') || text.includes('Repairing'))) {
                                         return text;
                                     }
                                 }
@@ -434,6 +485,8 @@ class ParserEngine:
                                 category = re.sub(r'Категория\s*:', '', category, flags=re.IGNORECASE)
                                 category = re.sub(r'Commission\s*Rate\s*:.*', '', category, flags=re.IGNORECASE)
                                 category = re.sub(r'Комиссия\s*:.*', '', category, flags=re.IGNORECASE)
+                                # Убираем проценты (например "15.00%")
+                                category = re.sub(r'\s*\d+\.?\d*\s*%', '', category)
                                 # Убираем лишние символы > и пробелы
                                 category = re.sub(r'\s*>\s*', ' > ', category)
                                 category = category.strip()
@@ -473,6 +526,9 @@ class ParserEngine:
                                         if (categoryText.includes('Commission Rate') || categoryText.includes('Комиссия')) {
                                             categoryText = categoryText.split('Commission Rate')[0].split('Комиссия')[0];
                                         }
+                                        
+                                        // Убираем проценты (например "15.00%")
+                                        categoryText = categoryText.replace(/\s*\d+\.?\d*\s*%/g, '');
                                         
                                         categoryText = categoryText.trim();
                                         
@@ -760,8 +816,8 @@ class ParserEngine:
             filtered_videos = await self._filter_videos(videos)
             log.info(f"  → После фильтрации: {len(filtered_videos)} видео")
             
-            # Выбор топ-3 видео (для MVP-0: 1 видео)
-            video_count = 1  # Для MVP-0
+            # Выбор топ-3 видео
+            video_count = 3
             selected_videos = filtered_videos[:video_count]
             
             log.info(f"  ✅ Выбрано {len(selected_videos)} видео для обработки")
@@ -779,7 +835,7 @@ class ParserEngine:
                     log.warning(f"    ⚠️ Не удалось получить детали для видео {i}")
                 await self.human_delay(0.5, 1)
             
-            # Заполняем N/A для отсутствующих видео (для MVP-0 нужно 1, потом расширим до 3)
+            # Заполняем N/A для отсутствующих видео (нужно 3 видео)
             while len(product_data.videos) < video_count:
                 product_data.videos.append({
                     "tiktok_link": "N/A",
@@ -1201,15 +1257,31 @@ class ParserEngine:
                 log.info("    ✅ Страница ad-search загружена")
             else:
                 # Если нет URL, кликаем на карточку
+                # ВАЖНО: Элемент может исчезнуть из DOM, поэтому ищем его заново
                 card_element = video.get("card_element")
                 if not card_element:
                     log.error("    ❌ Нет способа перейти к видео (нет URL и элемента)")
                     return None
                 
                 log.info("    → Клик на карточку видео...")
-                await card_element.click()
-                await self.human_delay(0.5, 1)
-                log.info("    ✅ Карточка видео открыта")
+                try:
+                    # Проверяем, что элемент еще в DOM
+                    is_attached = await card_element.evaluate("el => el.isConnected")
+                    if not is_attached:
+                        log.warning("    ⚠️ Элемент исчез из DOM, пытаемся найти заново...")
+                        # Пытаемся найти элемент заново по ad_search_url или другим признакам
+                        # Если не получается, возвращаем None
+                        log.error("    ❌ Не удалось найти элемент заново")
+                        return None
+                    
+                    await card_element.click()
+                    await self.human_delay(0.5, 1)
+                    log.info("    ✅ Карточка видео открыта")
+                except Exception as e:
+                    log.error(f"    ❌ Ошибка при клике на карточку: {e}")
+                    log.warning("    ⚠️ Пытаемся найти элемент заново...")
+                    # Если элемент исчез, возвращаем None
+                    return None
                 
                 # Ждем открытия окна/модального окна
                 # Ищем кнопку "More detail"
@@ -1297,23 +1369,36 @@ class ParserEngine:
                         # Ищем ссылку рядом
                         try:
                             parent_locator = locator.locator("..")
-                            link = await parent_locator.locator('a[href*="tiktok.com"]').first.element_handle()
+                            # Ищем ссылку на видео (приоритет ссылкам с /v/)
+                            link = await parent_locator.locator('a[href*="m.tiktok.com/v/"]').first.element_handle()
+                            if not link:
+                                link = await parent_locator.locator('a[href*="tiktok.com/v/"]').first.element_handle()
+                            if not link:
+                                link = await parent_locator.locator('a[href*="tiktok.com"]').first.element_handle()
                             if link:
                                 href = await link.get_attribute("href")
                                 if href:
-                                    video_data["tiktok_link"] = href
-                                    log.info(f"      ✅ TikTok ссылка найдена: {href[:50]}...")
-                                    break
+                                    # КРИТИЧНО: Пропускаем ссылки на товары в TikTok Shop
+                                    if "shop.tiktok.com/view/product" in href or "/view/product" in href:
+                                        log.debug(f"      → Пропущена ссылка на товар: {href[:50]}...")
+                                        continue
+                                    # Берем только ссылки на видео
+                                    if "/v/" in href or "m.tiktok.com" in href:
+                                        video_data["tiktok_link"] = href
+                                        log.info(f"      ✅ TikTok ссылка найдена: {href[:50]}...")
+                                        break
                         except:
                             pass
                 except:
                     continue
             
             # Если не нашли через текст, ищем все ссылки на TikTok
+            # ВАЖНО: Берем только ссылки на видео (m.tiktok.com/v/...), НЕ на товары (shop.tiktok.com/view/product/...)
             if video_data["tiktok_link"] == "N/A":
                 tiktok_link_selectors = [
-                    'a[href*="tiktok.com"]',
-                    'a[href*="m.tiktok.com"]',
+                    'a[href*="m.tiktok.com/v/"]',  # Приоритет: ссылки на видео
+                    'a[href*="tiktok.com/v/"]',    # Альтернативный формат
+                    'a[href*="tiktok.com"]',       # Fallback
                 ]
                 
                 for selector in tiktok_link_selectors:
@@ -1322,10 +1407,16 @@ class ParserEngine:
                         for link in links:
                             href = await link.get_attribute("href")
                             if href and "tiktok.com" in href:
-                                # Берем первую валидную ссылку
-                                video_data["tiktok_link"] = href
-                                log.info(f"      ✅ TikTok ссылка найдена: {href[:50]}...")
-                                break
+                                # КРИТИЧНО: Пропускаем ссылки на товары в TikTok Shop
+                                if "shop.tiktok.com/view/product" in href or "/view/product" in href:
+                                    log.debug(f"      → Пропущена ссылка на товар: {href[:50]}...")
+                                    continue
+                                
+                                # Берем только ссылки на видео (содержат /v/ в пути)
+                                if "/v/" in href or "m.tiktok.com" in href:
+                                    video_data["tiktok_link"] = href
+                                    log.info(f"      ✅ TikTok ссылка найдена: {href[:50]}...")
+                                    break
                         if video_data["tiktok_link"] != "N/A":
                             break
                     except:
@@ -1421,69 +1512,117 @@ class ParserEngine:
     async def _extract_impressions(self) -> Optional[str]:
         """
         Извлечь impressions - КРИТИЧНО: в разделе "Data/Данные" в пункте "Impression/Показ"
+        ВАЖНО: НЕ брать шаблонные значения, только реальные данные со страницы!
         
         Returns:
             Строка с impressions (например "170.6K", "339.9M") или None
         """
         try:
-            # Ищем раздел "Data" или "Данные"
+            # Метод 1: Поиск через JavaScript по структуре DOM (более надежно)
+            try:
+                impression_data = await self.page.evaluate("""
+                    () => {
+                        // Ищем раздел "Data" или "Данные"
+                        const dataKeywords = ['Data', 'Данные'];
+                        const impressionKeywords = ['Impression', 'Показ', 'Показы'];
+                        
+                        // Ищем все элементы с текстом "Data" или "Данные"
+                        const allElements = document.querySelectorAll('*');
+                        for (const el of allElements) {
+                            const text = el.innerText || '';
+                            
+                            // Проверяем, содержит ли элемент "Data" или "Данные"
+                            for (const dataKeyword of dataKeywords) {
+                                if (text.includes(dataKeyword)) {
+                                    // В этом разделе ищем "Impression" или "Показ"
+                                    for (const impKeyword of impressionKeywords) {
+                                        if (text.includes(impKeyword)) {
+                                            // Ищем число в формате "170.6K", "403.2M" и т.д.
+                                            const patterns = [
+                                                new RegExp(impKeyword + '[\\s:]*([\\d.,]+[KM]?)', 'i'),
+                                                new RegExp('([\\d.,]+[KM]?)\\s*' + impKeyword, 'i')
+                                            ];
+                                            
+                                            for (const pattern of patterns) {
+                                                const match = text.match(pattern);
+                                                if (match && match[1]) {
+                                                    const value = match[1];
+                                                    // Проверяем, что это не слишком большое число (не шаблонное)
+                                                    // Обычно реальные impressions от 50K до 500M
+                                                    const numValue = parseFloat(value.replace(/[KM]/i, ''));
+                                                    if (numValue >= 0.05 && numValue <= 1000) {
+                                                        return value;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Fallback: ищем напрямую "Impression" или "Показ" (НЕ "Likes"!)
+                        for (const impKeyword of impressionKeywords) {
+                            const elements = Array.from(document.querySelectorAll('*')).filter(el => {
+                                const text = el.innerText || '';
+                                return text.includes(impKeyword) && !text.toLowerCase().includes('likes') && !text.toLowerCase().includes('нравится');
+                            });
+                            
+                            for (const el of elements) {
+                                const text = el.innerText || '';
+                                const patterns = [
+                                    new RegExp(impKeyword + '[\\s:]*([\\d.,]+[KM]?)', 'i'),
+                                    new RegExp('([\\d.,]+[KM]?)\\s*' + impKeyword, 'i')
+                                ];
+                                
+                                for (const pattern of patterns) {
+                                    const match = text.match(pattern);
+                                    if (match && match[1]) {
+                                        const value = match[1];
+                                        const numValue = parseFloat(value.replace(/[KM]/i, ''));
+                                        if (numValue >= 0.05 && numValue <= 1000) {
+                                            return value;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return null;
+                    }
+                """)
+                
+                if impression_data:
+                    log.debug(f"Найдено impressions через JavaScript: {impression_data}")
+                    return impression_data
+            except Exception as e:
+                log.debug(f"Ошибка при поиске impressions через JS: {e}")
+            
+            # Метод 2: Поиск через локаторы (fallback)
             data_keywords = ["Data", "Данные"]
             
             for keyword in data_keywords:
                 try:
-                    # Ищем элемент с текстом "Data" или "Данные"
                     data_locator = self.page.locator(f'text=/{keyword}/i').first
                     if await data_locator.count() > 0:
-                        # Ищем "Impression" или "Показ" в этом разделе
                         impression_keywords = ["Impression", "Показ", "Показы"]
                         for imp_keyword in impression_keywords:
                             try:
-                                # Ищем элемент с текстом "Impression" или "Показ" рядом с "Data"
                                 parent_text = await data_locator.locator("..").inner_text()
-                                if imp_keyword in parent_text:
-                                    # Ищем число в формате "83.1M", "170.6K" и т.д.
+                                if imp_keyword in parent_text and "Likes" not in parent_text and "Нравится" not in parent_text:
                                     pattern = rf'{imp_keyword}[:\s]*([\d.,]+[KM]?)'
                                     match = re.search(pattern, parent_text, re.IGNORECASE)
                                     if match:
                                         impression_str = match.group(1)
-                                        log.debug(f"Найдено impressions в разделе Data: {impression_str}")
-                                        return impression_str
+                                        # Проверяем, что это не шаблонное значение
+                                        num_value = validator.parse_impressions(impression_str)
+                                        if num_value and 50000 <= num_value <= 1000000000:  # От 50K до 1B
+                                            log.debug(f"Найдено impressions в разделе Data: {impression_str}")
+                                            return impression_str
                             except:
                                 continue
                 except:
                     continue
-            
-            # Fallback: ищем напрямую "Impression" или "Показы" (не "Likes"!)
-            impression_keywords = ["Impression", "Показ", "Показы"]
-            page_text = await self.page.content()
-            
-            for keyword in impression_keywords:
-                # Паттерн для поиска с числом (приоритет английскому)
-                patterns = [
-                    rf'{keyword}[:\s]+([\d.,]+[KM]?)',
-                    rf'([\d.,]+[KM]?)\s*{keyword}',
-                ]
-                
-                for pattern in patterns:
-                    match = re.search(pattern, page_text, re.IGNORECASE)
-                    if match:
-                        impression_str = match.group(1)
-                        log.debug(f"Найдено impressions: {impression_str}")
-                        return impression_str
-            
-            # Если не нашли по паттерну, ищем элемент с текстом
-            try:
-                impression_locator = self.page.locator('text=/Impression/i').first
-                if await impression_locator.count() == 0:
-                    impression_locator = self.page.locator('text=/Показ/i').first
-                
-                if await impression_locator.count() > 0:
-                    parent_text = await impression_locator.locator("..").inner_text()
-                    match = re.search(r'([\d.,]+[KM]?)', parent_text)
-                    if match:
-                        return match.group(1)
-            except:
-                pass
             
             log.warning("Не удалось найти 'Impression' или 'Показ' в разделе Data")
             return None
@@ -1512,11 +1651,22 @@ class ParserEngine:
                                     script = parts[1].strip()
                                     # Убираем лишние метки
                                     stop_words = ["Hook", "Хук", "Target Audience", "Целевая аудитория", 
-                                                "First seen", "Впервые замечено", "Impressions", "Показы"]
+                                                "First seen", "Впервые замечено", "Impressions", "Показы",
+                                                "Limited Time Offer", "Annual Plan", "Promotion Period", "50% OFF",
+                                                "Privacy", "Terms", "Copyright", "PIPIADS", "All Rights Reserved",
+                                                "AI-agent", "cosmobeauty", "credits", "subscription", "invoice",
+                                                "Monthly Credits", "Extra Credits", "data cost", "detail costs",
+                                                "Team Setting", "Affiliate Dashboard", "Logout"]
+                                    # Проверяем, что это не футер/меню
+                                    footer_menu_keywords = ["Privacy", "Terms", "Copyright", "PIPIADS", "AI-agent", 
+                                                           "cosmobeauty", "credits", "subscription", "invoice", 
+                                                           "Monthly Credits", "Extra Credits", "@gmail.com"]
+                                    is_footer_menu = any(keyword in script for keyword in footer_menu_keywords)
+                                    
                                     for stop_word in stop_words:
                                         if stop_word in script:
                                             script = script.split(stop_word)[0].strip()
-                                    if script and len(script) > 10:
+                                    if script and len(script) > 10 and not is_footer_menu:
                                         log.debug(f"Script найден через '{keyword}' (родитель)")
                                         return script
                         except:
@@ -1527,7 +1677,12 @@ class ParserEngine:
                             next_sibling = await locator.evaluate_handle("el => el.nextElementSibling")
                             if next_sibling:
                                 script = await next_sibling.as_element().inner_text()
-                                if script and len(script) > 10:
+                                # Проверяем, что это не футер/меню
+                                footer_menu_keywords = ["Privacy", "Terms", "Copyright", "PIPIADS", "AI-agent", 
+                                                       "cosmobeauty", "credits", "subscription", "invoice", 
+                                                       "Monthly Credits", "Extra Credits", "@gmail.com"]
+                                is_footer_menu = any(keyword in script for keyword in footer_menu_keywords)
+                                if script and len(script) > 10 and not is_footer_menu:
                                     log.debug(f"Script найден через '{keyword}' (следующий элемент)")
                                     return script.strip()
                         except:
@@ -1535,27 +1690,66 @@ class ParserEngine:
                 except:
                     continue
             
-            # Метод 2: Поиск через JavaScript (более агрессивный)
+            # Метод 2: Поиск через JavaScript (более агрессивный - по структуре DOM)
             try:
                 script = await self.page.evaluate("""
                     () => {
                         const keywords = ['Script', 'Сценарий', 'Transcript', 'Анализ транскрипта', 'Транскрипт'];
                         const stopWords = ['Hook', 'Хук', 'Target Audience', 'Целевая аудитория', 
-                                          'First seen', 'Впервые замечено', 'Impressions', 'Показы'];
+                                          'First seen', 'Впервые замечено', 'Impressions', 'Показы',
+                                          'Analysis', 'Advertiser', 'Display Name', 'Ad Copy',
+                                          'Limited Time Offer', 'Annual Plan', 'Promotion Period', '50% OFF'];
                         
-                        // Ищем все элементы с текстом
+                        // Ищем элементы с ключевыми словами
                         const allElements = document.querySelectorAll('*');
                         for (const el of allElements) {
                             const text = el.innerText || '';
                             
                             for (const keyword of keywords) {
                                 if (text.includes(keyword)) {
-                                    // Извлекаем текст после ключевого слова
-                                    let scriptText = text;
-                                    if (scriptText.includes(keyword)) {
-                                        scriptText = scriptText.split(keyword)[1];
-                                        
-                                        // Убираем стоп-слова
+                                    // Ищем следующий элемент после ключевого слова (обычно это сам script)
+                                    let scriptText = null;
+                                    
+                                    // Способ 1: Текст следующего sibling элемента
+                                    let nextSibling = el.nextElementSibling;
+                                    if (nextSibling) {
+                                        scriptText = nextSibling.innerText || '';
+                                    }
+                                    
+                                    // Способ 2: Текст родительского элемента после ключевого слова
+                                    if (!scriptText || scriptText.length < 10) {
+                                        const parentText = el.parentElement ? el.parentElement.innerText || '' : '';
+                                        if (parentText.includes(keyword)) {
+                                            const parts = parentText.split(keyword);
+                                            if (parts.length > 1) {
+                                                scriptText = parts[1].trim();
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Способ 3: Ищем в дочерних элементах (обычно script в отдельном блоке)
+                                    if (!scriptText || scriptText.length < 10) {
+                                        const children = el.querySelectorAll('p, div, span');
+                                        for (const child of children) {
+                                            const childText = child.innerText || '';
+                                            // Пропускаем метаданные и промо-тексты
+                                            if (childText.length > 20 && 
+                                                !childText.includes('Advertiser') && 
+                                                !childText.includes('Display Name') &&
+                                                !childText.includes('Analysis') &&
+                                                !childText.includes('Generator') &&
+                                                !childText.includes('Limited Time Offer') &&
+                                                !childText.includes('Annual Plan') &&
+                                                !childText.includes('Promotion Period') &&
+                                                !childText.includes('50% OFF')) {
+                                                scriptText = childText;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (scriptText) {
+                                        // Убираем стоп-слова и метаданные
                                         for (const stopWord of stopWords) {
                                             if (scriptText.includes(stopWord)) {
                                                 scriptText = scriptText.split(stopWord)[0];
@@ -1564,7 +1758,25 @@ class ParserEngine:
                                         
                                         scriptText = scriptText.trim();
                                         
-                                        if (scriptText && scriptText.length > 10) {
+                                        // Проверяем, что это похоже на реальный script (не метаданные, не промо-текст, не футер/меню)
+                                        const footerMenuKeywords = ['Privacy', 'Terms', 'Copyright', 'PIPIADS', 'All Rights Reserved',
+                                                                   'AI-agent', 'cosmobeauty', 'credits', 'subscription', 'invoice',
+                                                                   'Monthly Credits', 'Extra Credits', 'data cost', 'detail costs',
+                                                                   'Team Setting', 'Affiliate Dashboard', 'Logout', '@gmail.com',
+                                                                   'English', 'Français', 'Deutsch', 'Español', 'Português'];
+                                        const isFooterMenu = footerMenuKeywords.some(keyword => scriptText.includes(keyword));
+                                        
+                                        if (scriptText && scriptText.length > 20 && 
+                                            !scriptText.startsWith('Analysis') &&
+                                            !scriptText.includes('shop.tiktok.com') &&
+                                            !scriptText.includes('Generator Image') &&
+                                            !scriptText.includes('Limited Time Offer') &&
+                                            !scriptText.includes('Annual Plan') &&
+                                            !scriptText.includes('Promotion Period') &&
+                                            !scriptText.includes('50% OFF') &&
+                                            !scriptText.toLowerCase().includes('q4') &&
+                                            !scriptText.toLowerCase().includes('monthly plan') &&
+                                            !isFooterMenu) {
                                             return scriptText;
                                         }
                                     }
@@ -1605,11 +1817,22 @@ class ParserEngine:
                                     hook = parts[1].strip()
                                     # Убираем лишние метки
                                     stop_words = ["Target Audience", "Целевая аудитория", "First seen", "Впервые замечено", 
-                                                "Transcript", "Анализ транскрипта", "Impressions", "Показы"]
+                                                "Transcript", "Анализ транскрипта", "Impressions", "Показы",
+                                                "Limited Time Offer", "Annual Plan", "Promotion Period", "50% OFF",
+                                                "Privacy", "Terms", "Copyright", "PIPIADS", "All Rights Reserved",
+                                                "AI-agent", "cosmobeauty", "credits", "subscription", "invoice",
+                                                "Monthly Credits", "Extra Credits", "data cost", "detail costs",
+                                                "Team Setting", "Affiliate Dashboard", "Logout"]
+                                    # Проверяем, что это не футер/меню
+                                    footer_menu_keywords = ["Privacy", "Terms", "Copyright", "PIPIADS", "AI-agent", 
+                                                           "cosmobeauty", "credits", "subscription", "invoice", 
+                                                           "Monthly Credits", "Extra Credits", "@gmail.com"]
+                                    is_footer_menu = any(keyword in hook for keyword in footer_menu_keywords)
+                                    
                                     for stop_word in stop_words:
                                         if stop_word in hook:
                                             hook = hook.split(stop_word)[0].strip()
-                                    if hook and len(hook) > 5:
+                                    if hook and len(hook) > 5 and not is_footer_menu:
                                         log.debug(f"Hook найден через '{keyword}' (родитель)")
                                         return hook
                         except:
@@ -1620,7 +1843,12 @@ class ParserEngine:
                             next_sibling = await locator.evaluate_handle("el => el.nextElementSibling")
                             if next_sibling:
                                 hook = await next_sibling.as_element().inner_text()
-                                if hook and len(hook) > 5:
+                                # Проверяем, что это не футер/меню
+                                footer_menu_keywords = ["Privacy", "Terms", "Copyright", "PIPIADS", "AI-agent", 
+                                                       "cosmobeauty", "credits", "subscription", "invoice", 
+                                                       "Monthly Credits", "Extra Credits", "@gmail.com"]
+                                is_footer_menu = any(keyword in hook for keyword in footer_menu_keywords)
+                                if hook and len(hook) > 5 and not is_footer_menu:
                                     log.debug(f"Hook найден через '{keyword}' (следующий элемент)")
                                     return hook.strip()
                         except:
@@ -1628,24 +1856,56 @@ class ParserEngine:
                 except:
                     continue
             
-            # Метод 2: Поиск через JavaScript
+            # Метод 2: Поиск через JavaScript (более агрессивный - по структуре DOM)
             try:
                 hook = await self.page.evaluate("""
                     () => {
                         const keywords = ['Hooks', 'Hook', 'Хуки', 'Хук'];
                         const stopWords = ['Target Audience', 'Целевая аудитория', 'First seen', 'Впервые замечено', 
-                                         'Transcript', 'Анализ транскрипта', 'Impressions', 'Показы'];
+                                         'Transcript', 'Анализ транскрипта', 'Impressions', 'Показы',
+                                         'Script', 'Сценарий', 'Analysis',
+                                         'Limited Time Offer', 'Annual Plan', 'Promotion Period', '50% OFF'];
                         
+                        // Ищем элементы с ключевыми словами
                         const allElements = document.querySelectorAll('*');
                         for (const el of allElements) {
                             const text = el.innerText || '';
                             
                             for (const keyword of keywords) {
                                 if (text.includes(keyword)) {
-                                    let hookText = text;
-                                    if (hookText.includes(keyword)) {
-                                        hookText = hookText.split(keyword)[1];
-                                        
+                                    let hookText = null;
+                                    
+                                    // Способ 1: Текст следующего sibling элемента
+                                    let nextSibling = el.nextElementSibling;
+                                    if (nextSibling) {
+                                        hookText = nextSibling.innerText || '';
+                                    }
+                                    
+                                    // Способ 2: Текст родительского элемента после ключевого слова
+                                    if (!hookText || hookText.length < 5) {
+                                        const parentText = el.parentElement ? el.parentElement.innerText || '' : '';
+                                        if (parentText.includes(keyword)) {
+                                            const parts = parentText.split(keyword);
+                                            if (parts.length > 1) {
+                                                hookText = parts[1].trim();
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Способ 3: Ищем в дочерних элементах
+                                    if (!hookText || hookText.length < 5) {
+                                        const children = el.querySelectorAll('p, div, span');
+                                        for (const child of children) {
+                                            const childText = child.innerText || '';
+                                            if (childText.length > 5 && childText.length < 200) {
+                                                hookText = childText;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (hookText) {
+                                        // Убираем стоп-слова
                                         for (const stopWord of stopWords) {
                                             if (hookText.includes(stopWord)) {
                                                 hookText = hookText.split(stopWord)[0];
@@ -1654,7 +1914,22 @@ class ParserEngine:
                                         
                                         hookText = hookText.trim();
                                         
-                                        if (hookText && hookText.length > 5) {
+                                        // Проверяем, что это похоже на реальный hook (короткая фраза, не промо-текст, не футер/меню)
+                                        const footerMenuKeywords = ['Privacy', 'Terms', 'Copyright', 'PIPIADS', 'All Rights Reserved',
+                                                                   'AI-agent', 'cosmobeauty', 'credits', 'subscription', 'invoice',
+                                                                   'Monthly Credits', 'Extra Credits', 'data cost', 'detail costs',
+                                                                   'Team Setting', 'Affiliate Dashboard', 'Logout', '@gmail.com',
+                                                                   'English', 'Français', 'Deutsch', 'Español', 'Português'];
+                                        const isFooterMenu = footerMenuKeywords.some(keyword => hookText.includes(keyword));
+                                        
+                                        if (hookText && hookText.length > 5 && hookText.length < 300 &&
+                                            !hookText.includes('Limited Time Offer') &&
+                                            !hookText.includes('Annual Plan') &&
+                                            !hookText.includes('Promotion Period') &&
+                                            !hookText.includes('50% OFF') &&
+                                            !hookText.toLowerCase().includes('q4') &&
+                                            !hookText.toLowerCase().includes('monthly plan') &&
+                                            !isFooterMenu) {
                                             return hookText;
                                         }
                                     }
@@ -1924,7 +2199,7 @@ class ParserEngine:
                 except:
                     continue
             
-            # Метод 2: Поиск через JavaScript (более агрессивный)
+            # Метод 2: Поиск через JavaScript (более агрессивный - по структуре DOM)
             try:
                 first_seen = await self.page.evaluate("""
                     () => {
@@ -1953,14 +2228,10 @@ class ParserEngine:
                                     for (const pattern of datePatterns) {
                                         const match = afterKeyword.match(pattern);
                                         if (match) {
-                                            return match[1].replace(',', '').trim();
+                                            const dateStr = match[1].replace(',', '').trim();
+                                            // Возвращаем первую найденную дату (без проверок - фильтрация будет в _filter_videos)
+                                            return dateStr;
                                         }
-                                    }
-                                    
-                                    // Ищем дату в тексте элемента (тоже только первую)
-                                    const firstDate = text.match(datePatterns[0]);
-                                    if (firstDate) {
-                                        return firstDate[1].replace(',', '').trim();
                                     }
                                 }
                             }
