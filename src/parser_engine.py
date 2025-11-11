@@ -345,6 +345,14 @@ class ParserEngine:
                                 # Убираем префикс "TikTok Shop Product Detail:" если есть
                                 if "TikTok Shop Product Detail:" in name:
                                     name = name.split("TikTok Shop Product Detail:")[-1].strip()
+                                # Убираем "TikTok Shop Product" из начала и конца
+                                if name.lower().startswith('tiktok shop product'):
+                                    name = re.sub(r'^tiktok shop product\s*:?\s*', '', name, flags=re.IGNORECASE).strip()
+                                if name.lower().endswith('tiktok shop product'):
+                                    name = re.sub(r'\s*tiktok shop product\s*$', '', name, flags=re.IGNORECASE).strip()
+                                # Убираем, если это просто "TikTok Shop Product"
+                                if name.lower() == 'tiktok shop product' or name.lower() == 'tiktok shop product detail':
+                                    continue
                                 if ":" in name and len(name.split(":")[0]) < 20:
                                     name = name.split(":", 1)[-1].strip()
                                 product_data.product_name = name.strip()
@@ -388,11 +396,13 @@ class ParserEngine:
                                     const text = h.innerText.trim();
                                     const skipWords = ['tiktok', 'shop', 'product', 'detail', 'category', 'commission', 
                                                       'остаток', 'remain', 'stock', 'ad analysis', 'analysis', 
-                                                      'limited time', 'promotion', 'annual plan'];
+                                                      'limited time', 'promotion', 'annual plan', 'tiktok shop product'];
                                     const textLower = text.toLowerCase();
                                     // Пропускаем короткие тексты (меньше 20 символов) - это обычно не название товара
+                                    // Пропускаем "TikTok Shop Product" и похожие тексты
                                     if (!skipWords.some(word => textLower.includes(word)) && 
-                                        text.length > maxLength && text.length > 20) {
+                                        text.length > maxLength && text.length > 20 &&
+                                        !textLower.includes('tiktok shop product')) {
                                         maxLength = text.length;
                                         bestHeading = text;
                                     }
@@ -437,7 +447,11 @@ class ParserEngine:
                                     if (title.includes('TikTok Shop Product Detail:')) {
                                         title = title.split('TikTok Shop Product Detail:')[1].trim();
                                     }
-                                    if (title && title.length > 5) {
+                                    // Убираем "TikTok Shop Product" из начала
+                                    if (title.toLowerCase().startsWith('tiktok shop product')) {
+                                        title = title.replace(/^tiktok shop product\s*:?\s*/i, '').trim();
+                                    }
+                                    if (title && title.length > 5 && !title.toLowerCase().includes('tiktok shop product')) {
                                         return title;
                                     }
                                 }
@@ -446,8 +460,18 @@ class ParserEngine:
                             }
                         """)
                         if product_name and len(product_name) > 5:
-                            product_data.product_name = product_name.strip()
-                            log.info(f"  ✅ Название товара найдено (через JS): {product_data.product_name[:50]}...")
+                            product_name = product_name.strip()
+                            # Убираем "TikTok Shop Product" из начала и конца
+                            if product_name.lower().startswith('tiktok shop product'):
+                                product_name = re.sub(r'^tiktok shop product\s*:?\s*', '', product_name, flags=re.IGNORECASE).strip()
+                            if product_name.lower().endswith('tiktok shop product'):
+                                product_name = re.sub(r'\s*tiktok shop product\s*$', '', product_name, flags=re.IGNORECASE).strip()
+                            # Убираем, если это просто "TikTok Shop Product"
+                            if product_name.lower() == 'tiktok shop product' or product_name.lower() == 'tiktok shop product detail':
+                                product_name = None
+                            if product_name and len(product_name) > 5:
+                                product_data.product_name = product_name
+                                log.info(f"  ✅ Название товара найдено (через JS): {product_data.product_name[:50]}...")
                     except Exception as e:
                         log.debug(f"  → Ошибка при поиске через JS: {e}")
             except Exception as e:
@@ -1319,8 +1343,9 @@ class ParserEngine:
                 log.info("    ✅ Страница ad-search загружена")
             
             # Извлекаем данные со страницы ad-search
+            # Передаем исходные данные видео (impressions из карточки) для fallback
             log.info("    → Извлечение данных со страницы ad-search...")
-            return await self._extract_ad_search_data()
+            return await self._extract_ad_search_data(video)
             
         except Exception as e:
             log.error(f"    ❌ Ошибка при получении деталей видео: {e}")
@@ -1328,9 +1353,12 @@ class ParserEngine:
             log.error(traceback.format_exc())
             return None
     
-    async def _extract_ad_search_data(self) -> Dict[str, Any]:
+    async def _extract_ad_search_data(self, original_video: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Извлечь все данные со страницы ad-search
+        
+        Args:
+            original_video: Исходные данные видео из карточки (для fallback impressions)
         
         Returns:
             Словарь с данными видео
@@ -1344,6 +1372,12 @@ class ParserEngine:
             "country": "N/A",
             "first_seen": "N/A",
         }
+        
+        # Сохраняем impressions из карточки для fallback
+        if original_video:
+            original_impression = original_video.get("impression")
+            if original_impression:
+                video_data["_original_impression"] = original_impression
         
         try:
             # Ждем загрузки страницы
@@ -1427,6 +1461,7 @@ class ParserEngine:
             
             # 2. Impressions - КРИТИЧНО: "Impressions" (англ.) или "Показы" (рус.), не "Likes" или "Нравится"!
             # Ищем в разделе "Data/Данные" в пункте "Impression/Показ"
+            # Если не найдены на странице ad-search, используем из карточки (если есть)
             log.info("      → Извлечение impressions...")
             impression_text = await self._extract_impressions()
             if impression_text:
@@ -1440,8 +1475,22 @@ class ParserEngine:
                     video_data["impression"] = validator.format_impressions(impression_num)
                     log.info(f"      ✅ Impressions (сформатировано): {video_data['impression']}")
             else:
-                video_data["impression"] = "N/A"
-                log.warning("      ⚠️ Impressions не найдены")
+                # Если не найдены на странице ad-search, проверяем, есть ли они в исходных данных видео
+                # (из карточки на странице товара)
+                original_impression = video_data.get("_original_impression")
+                if original_impression:
+                    if isinstance(original_impression, (int, float)) and original_impression > 0:
+                        video_data["impression"] = validator.format_impressions(int(original_impression))
+                        log.info(f"      ✅ Impressions из карточки: {video_data['impression']}")
+                    elif isinstance(original_impression, str) and original_impression != "N/A":
+                        video_data["impression"] = original_impression
+                        log.info(f"      ✅ Impressions из карточки (строка): {original_impression}")
+                    else:
+                        video_data["impression"] = "N/A"
+                        log.warning("      ⚠️ Impressions не найдены ни на странице ad-search, ни в карточке")
+                else:
+                    video_data["impression"] = "N/A"
+                    log.warning("      ⚠️ Impressions не найдены")
             
             # 3. Script (из "Transcript" или "Анализ транскрипта")
             log.info("      → Извлечение сценария (script)...")
@@ -1666,7 +1715,23 @@ class ParserEngine:
                                     for stop_word in stop_words:
                                         if stop_word in script:
                                             script = script.split(stop_word)[0].strip()
-                                    if script and len(script) > 10 and not is_footer_menu:
+                                    # Фильтруем метаданные (Video Text Translator, Quality, Size и т.д.)
+                                    metadata_keywords = ["Video Text Translator", "Translator", "Quality", "Size", "Resolution", 
+                                                        "Width", "Height", "Duration", "Format", "Codec", "Frame Rate"]
+                                    is_metadata = any(keyword in script for keyword in metadata_keywords)
+                                    
+                                    # Убираем теги (строки, начинающиеся с #) и служебные слова
+                                    lines = script.split('\n')
+                                    cleaned_lines = []
+                                    skip_words = ['Tags', 'Script', 'Hooks', 'Tag', 'Hook']
+                                    for line in lines:
+                                        line = line.strip()
+                                        # Пропускаем теги (начинаются с #), пустые строки и служебные слова
+                                        if line and not line.startswith('#') and not any(skip in line for skip in skip_words):
+                                            cleaned_lines.append(line)
+                                    script = '\n'.join(cleaned_lines).strip()
+                                    
+                                    if script and len(script) > 10 and not is_footer_menu and not is_metadata:
                                         log.debug(f"Script найден через '{keyword}' (родитель)")
                                         return script
                         except:
@@ -1682,7 +1747,22 @@ class ParserEngine:
                                                        "cosmobeauty", "credits", "subscription", "invoice", 
                                                        "Monthly Credits", "Extra Credits", "@gmail.com"]
                                 is_footer_menu = any(keyword in script for keyword in footer_menu_keywords)
-                                if script and len(script) > 10 and not is_footer_menu:
+                                # Фильтруем метаданные
+                                metadata_keywords = ["Video Text Translator", "Translator", "Quality", "Size", "Resolution"]
+                                is_metadata = any(keyword in script for keyword in metadata_keywords)
+                                
+                                # Убираем теги (строки, начинающиеся с #) и служебные слова
+                                lines = script.split('\n')
+                                cleaned_lines = []
+                                skip_words = ['Tags', 'Script', 'Hooks', 'Tag', 'Hook']
+                                for line in lines:
+                                    line = line.strip()
+                                    # Пропускаем теги (начинаются с #), пустые строки и служебные слова
+                                    if line and not line.startswith('#') and not any(skip in line for skip in skip_words):
+                                        cleaned_lines.append(line)
+                                script = '\n'.join(cleaned_lines).strip()
+                                
+                                if script and len(script) > 10 and not is_footer_menu and not is_metadata:
                                     log.debug(f"Script найден через '{keyword}' (следующий элемент)")
                                     return script.strip()
                         except:
@@ -1758,6 +1838,20 @@ class ParserEngine:
                                         
                                         scriptText = scriptText.trim();
                                         
+                                        // Убираем теги (строки, начинающиеся с #) и служебные слова
+                                        const skipWords = ['Tags', 'Script', 'Hooks', 'Tag', 'Hook'];
+                                        const lines = scriptText.split('\\n');
+                                        const cleanedLines = [];
+                                        for (const line of lines) {
+                                            const trimmedLine = line.trim();
+                                            // Пропускаем теги (начинаются с #), пустые строки и служебные слова
+                                            if (trimmedLine && !trimmedLine.startsWith('#') && 
+                                                !skipWords.some(word => trimmedLine.includes(word))) {
+                                                cleanedLines.push(trimmedLine);
+                                            }
+                                        }
+                                        scriptText = cleanedLines.join('\\n').trim();
+                                        
                                         // Проверяем, что это похоже на реальный script (не метаданные, не промо-текст, не футер/меню)
                                         const footerMenuKeywords = ['Privacy', 'Terms', 'Copyright', 'PIPIADS', 'All Rights Reserved',
                                                                    'AI-agent', 'cosmobeauty', 'credits', 'subscription', 'invoice',
@@ -1766,7 +1860,12 @@ class ParserEngine:
                                                                    'English', 'Français', 'Deutsch', 'Español', 'Português'];
                                         const isFooterMenu = footerMenuKeywords.some(keyword => scriptText.includes(keyword));
                                         
-                                        if (scriptText && scriptText.length > 20 && 
+                                        // Фильтруем короткие тексты и метаданные
+                                    const metadataKeywords = ['Video Text Translator', 'Translator', 'Quality', 'Size', 'Resolution', 
+                                                             'Width', 'Height', 'Duration', 'Format', 'Codec', 'Frame Rate'];
+                                    const isMetadata = metadataKeywords.some(keyword => scriptText.includes(keyword));
+                                    
+                                    if (scriptText && scriptText.length > 20 && 
                                             !scriptText.startsWith('Analysis') &&
                                             !scriptText.includes('shop.tiktok.com') &&
                                             !scriptText.includes('Generator Image') &&
@@ -1776,7 +1875,8 @@ class ParserEngine:
                                             !scriptText.includes('50% OFF') &&
                                             !scriptText.toLowerCase().includes('q4') &&
                                             !scriptText.toLowerCase().includes('monthly plan') &&
-                                            !isFooterMenu) {
+                                            !isFooterMenu &&
+                                            !isMetadata) {
                                             return scriptText;
                                         }
                                     }
@@ -1799,9 +1899,177 @@ class ParserEngine:
             return None
     
     async def _extract_hook(self) -> Optional[str]:
-        """Извлечь hook из секции Hook/Hooks (англ.) или Хук/Хуки (рус.)"""
+        """Извлечь hook из секции Hook/Hooks (англ.) или Хук/Хуки (рус.)
+        ВАЖНО: Hook находится сразу после Script на странице!
+        """
         try:
-            # Метод 1: Поиск через локаторы
+            # НОВЫЙ МЕТОД: Ищем Script, затем ищем Hook в следующем элементе/секции
+            try:
+                # Сначала находим Script
+                script_keywords = ["Script", "Сценарий", "Transcript", "Анализ транскрипта"]
+                for script_keyword in script_keywords:
+                    try:
+                        script_locator = self.page.locator(f'text=/{script_keyword}/i').first
+                        if await script_locator.count() > 0:
+                            # Ищем следующий элемент после Script, который содержит "Hook" или "Hooks"
+                            # Или просто следующий текстовый блок после Script
+                            try:
+                                # Способ 1: Ищем элемент с "Hook" или "Hooks" после Script
+                                parent = script_locator.locator("..")
+                                parent_text = await parent.inner_text()
+                                
+                                # Ищем "Hook" или "Hooks" в том же родительском элементе
+                                if "Hook" in parent_text or "Hooks" in parent_text or "Хук" in parent_text or "Хуки" in parent_text:
+                                    # Находим позицию Script и Hook в тексте
+                                    script_pos = parent_text.find(script_keyword)
+                                    hook_pos = -1
+                                    for hook_word in ["Hook", "Hooks", "Хук", "Хуки"]:
+                                        pos = parent_text.find(hook_word, script_pos)
+                                        if pos > script_pos:
+                                            hook_pos = pos
+                                            break
+                                    
+                                    if hook_pos > script_pos:
+                                        # Извлекаем текст после "Hook" или "Hooks"
+                                        hook_section = parent_text[hook_pos:]
+                                        # Убираем "Hook" или "Hooks" из начала
+                                        hook_section = re.sub(r'^Hooks?\s*:?\s*', '', hook_section, flags=re.IGNORECASE)
+                                        hook_section = re.sub(r'^Хуки?\s*:?\s*', '', hook_section, flags=re.IGNORECASE)
+                                        hook_text = hook_section.strip()
+                                        
+                                        # Убираем следующие секции (Target Audience, First seen и т.д.)
+                                        stop_words = ["Target Audience", "Целевая аудитория", "First seen", "Впервые замечено", 
+                                                    "Impressions", "Показы", "Country", "Страна", "Country/Region", "Страна/регион"]
+                                        for stop_word in stop_words:
+                                            if stop_word in hook_text:
+                                                hook_text = hook_text.split(stop_word)[0].strip()
+                                        
+                                        # Убираем метаданные
+                                        hook_text = re.sub(r'Quality\s*:?\s*[^\n]*', '', hook_text, flags=re.IGNORECASE)
+                                        hook_text = re.sub(r'Size\s*:?\s*[^\n]*', '', hook_text, flags=re.IGNORECASE)
+                                        hook_text = re.sub(r'Resolution\s*:?\s*[^\n]*', '', hook_text, flags=re.IGNORECASE)
+                                        hook_text = re.sub(r'--', '', hook_text)
+                                        hook_text = re.sub(r'\n{2,}', '\n', hook_text).strip()
+                                        
+                                        # Убираем служебные слова в начале
+                                        hook_text = re.sub(r'^(Tags|Script|Hooks?)\s*:?\s*', '', hook_text, flags=re.IGNORECASE)
+                                        
+                                        if hook_text and len(hook_text) > 5 and len(hook_text) < 500:
+                                            log.debug(f"Hook найден после Script через '{script_keyword}'")
+                                            return hook_text
+                            except:
+                                pass
+                            
+                            # Способ 2: Ищем следующий sibling элемент после Script
+                            try:
+                                script_element = await script_locator.element_handle()
+                                if script_element:
+                                    # Ищем следующий элемент с текстом "Hook" или "Hooks"
+                                    next_elements = await self.page.evaluate("""
+                                        (scriptEl) => {
+                                            let current = scriptEl;
+                                            // Ищем следующий элемент с "Hook" или "Hooks"
+                                            for (let i = 0; i < 10; i++) {
+                                                current = current.nextElementSibling;
+                                                if (!current) break;
+                                                const text = current.innerText || '';
+                                                if (text.includes('Hook') || text.includes('Hooks') || 
+                                                    text.includes('Хук') || text.includes('Хуки')) {
+                                                    // Извлекаем текст после "Hook" или "Hooks"
+                                                    const parts = text.split(/Hooks?\\s*:?\\s*|Хуки?\\s*:?\\s*/i);
+                                                    if (parts.length > 1) {
+                                                        let hookText = parts[1].trim();
+                                                        // Убираем следующие секции
+                                                        const stopWords = ['Target Audience', 'First seen', 'Impressions', 'Country'];
+                                                        for (const stop of stopWords) {
+                                                            if (hookText.includes(stop)) {
+                                                                hookText = hookText.split(stop)[0];
+                                                            }
+                                                        }
+                                                        hookText = hookText.replace(/Quality\\s*:?\\s*[^\\n]*/gi, '');
+                                                        hookText = hookText.replace(/Size\\s*:?\\s*[^\\n]*/gi, '');
+                                                        hookText = hookText.replace(/Resolution\\s*:?\\s*[^\\n]*/gi, '');
+                                                        hookText = hookText.replace(/--/g, '');
+                                                        hookText = hookText.replace(/\\n{2,}/g, '\\n').trim();
+                                                        if (hookText && hookText.length > 5 && hookText.length < 500) {
+                                                            return hookText;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            return null;
+                                        }
+                                    """, script_element)
+                                    
+                                    if next_elements:
+                                        log.debug(f"Hook найден в следующем элементе после Script")
+                                        return next_elements
+                            except:
+                                pass
+                            
+                            # Способ 3: Ищем Hook в родительском контейнере после Script
+                            try:
+                                # Получаем весь текст страницы и ищем паттерн "Script...Hook"
+                                page_text = await self.page.content()
+                                # Ищем через JavaScript более агрессивно
+                                hook_text = await self.page.evaluate("""
+                                    () => {
+                                        // Ищем все элементы с текстом "Script"
+                                        const allElements = Array.from(document.querySelectorAll('*'));
+                                        for (const el of allElements) {
+                                            const text = el.innerText || '';
+                                            if (text.includes('Script') || text.includes('Сценарий')) {
+                                                // Ищем в этом же элементе или родительском "Hook" или "Hooks"
+                                                let searchEl = el;
+                                                for (let depth = 0; depth < 3; depth++) {
+                                                    const searchText = searchEl.innerText || '';
+                                                    if (searchText.includes('Hook') || searchText.includes('Hooks') || 
+                                                        searchText.includes('Хук') || searchText.includes('Хуки')) {
+                                                        // Извлекаем текст между Script и следующими секциями
+                                                        const scriptIndex = searchText.indexOf('Script');
+                                                        const hookIndex = searchText.indexOf('Hook', scriptIndex);
+                                                        if (hookIndex > scriptIndex) {
+                                                            let hookText = searchText.substring(hookIndex);
+                                                            // Убираем "Hook" или "Hooks" из начала
+                                                            hookText = hookText.replace(/^Hooks?\\s*:?\\s*/i, '');
+                                                            hookText = hookText.replace(/^Хуки?\\s*:?\\s*/i, '');
+                                                            // Убираем следующие секции
+                                                            const stopWords = ['Target Audience', 'First seen', 'Impressions', 'Country'];
+                                                            for (const stop of stopWords) {
+                                                                if (hookText.includes(stop)) {
+                                                                    hookText = hookText.split(stop)[0];
+                                                                }
+                                                            }
+                                                            hookText = hookText.replace(/Quality\\s*:?\\s*[^\\n]*/gi, '');
+                                                            hookText = hookText.replace(/Size\\s*:?\\s*[^\\n]*/gi, '');
+                                                            hookText = hookText.replace(/Resolution\\s*:?\\s*[^\\n]*/gi, '');
+                                                            hookText = hookText.replace(/--/g, '');
+                                                            hookText = hookText.replace(/\\n{2,}/g, '\\n').trim();
+                                                            if (hookText && hookText.length > 5 && hookText.length < 500) {
+                                                                return hookText;
+                                                            }
+                                                        }
+                                                    }
+                                                    searchEl = searchEl.parentElement;
+                                                    if (!searchEl) break;
+                                                }
+                                            }
+                                        }
+                                        return null;
+                                    }
+                                """)
+                                
+                                if hook_text:
+                                    log.debug(f"Hook найден через агрессивный поиск после Script")
+                                    return hook_text
+                            except:
+                                pass
+                    except:
+                        continue
+            except:
+                pass
+            
+            # Метод 1: Поиск через локаторы (старый способ, оставляем как fallback)
             hook_keywords = ["Hooks", "Hook", "Хуки", "Хук"]
             
             for keyword in hook_keywords:
@@ -1832,6 +2100,24 @@ class ParserEngine:
                                     for stop_word in stop_words:
                                         if stop_word in hook:
                                             hook = hook.split(stop_word)[0].strip()
+                                    
+                                    # Убираем метаданные видео (Quality, Size, Resolution и т.д.)
+                                    metadata_patterns = [
+                                        r'Quality\s*:?\s*[^\n]*',
+                                        r'Size\s*:?\s*[^\n]*',
+                                        r'Resolution\s*:?\s*[^\n]*',
+                                        r'Width\s*:?\s*[^\n]*',
+                                        r'Height\s*:?\s*[^\n]*',
+                                        r'Duration\s*:?\s*[^\n]*',
+                                        r'Format\s*:?\s*[^\n]*',
+                                        r'Codec\s*:?\s*[^\n]*',
+                                        r'Frame Rate\s*:?\s*[^\n]*',
+                                        r'--',  # Убираем разделители "--"
+                                    ]
+                                    for pattern in metadata_patterns:
+                                        hook = re.sub(pattern, '', hook, flags=re.IGNORECASE)
+                                    hook = re.sub(r'\n{2,}', '\n', hook).strip()  # Убираем множественные переносы строк
+                                    
                                     if hook and len(hook) > 5 and not is_footer_menu:
                                         log.debug(f"Hook найден через '{keyword}' (родитель)")
                                         return hook
@@ -1848,6 +2134,24 @@ class ParserEngine:
                                                        "cosmobeauty", "credits", "subscription", "invoice", 
                                                        "Monthly Credits", "Extra Credits", "@gmail.com"]
                                 is_footer_menu = any(keyword in hook for keyword in footer_menu_keywords)
+                                
+                                # Убираем метаданные видео (Quality, Size, Resolution и т.д.)
+                                metadata_patterns = [
+                                    r'Quality\s*:?\s*[^\n]*',
+                                    r'Size\s*:?\s*[^\n]*',
+                                    r'Resolution\s*:?\s*[^\n]*',
+                                    r'Width\s*:?\s*[^\n]*',
+                                    r'Height\s*:?\s*[^\n]*',
+                                    r'Duration\s*:?\s*[^\n]*',
+                                    r'Format\s*:?\s*[^\n]*',
+                                    r'Codec\s*:?\s*[^\n]*',
+                                    r'Frame Rate\s*:?\s*[^\n]*',
+                                    r'--',  # Убираем разделители "--"
+                                ]
+                                for pattern in metadata_patterns:
+                                    hook = re.sub(pattern, '', hook, flags=re.IGNORECASE)
+                                hook = re.sub(r'\n{2,}', '\n', hook).strip()  # Убираем множественные переносы строк
+                                
                                 if hook and len(hook) > 5 and not is_footer_menu:
                                     log.debug(f"Hook найден через '{keyword}' (следующий элемент)")
                                     return hook.strip()
@@ -1922,15 +2226,34 @@ class ParserEngine:
                                                                    'English', 'Français', 'Deutsch', 'Español', 'Português'];
                                         const isFooterMenu = footerMenuKeywords.some(keyword => hookText.includes(keyword));
                                         
-                                        if (hookText && hookText.length > 5 && hookText.length < 300 &&
-                                            !hookText.includes('Limited Time Offer') &&
-                                            !hookText.includes('Annual Plan') &&
-                                            !hookText.includes('Promotion Period') &&
-                                            !hookText.includes('50% OFF') &&
-                                            !hookText.toLowerCase().includes('q4') &&
-                                            !hookText.toLowerCase().includes('monthly plan') &&
+                                        // Убираем метаданные видео (Quality, Size, Resolution и т.д.)
+                                        const metadataPatterns = [
+                                            /Quality\s*:?\s*[^\n]*/gi,
+                                            /Size\s*:?\s*[^\n]*/gi,
+                                            /Resolution\s*:?\s*[^\n]*/gi,
+                                            /Width\s*:?\s*[^\n]*/gi,
+                                            /Height\s*:?\s*[^\n]*/gi,
+                                            /Duration\s*:?\s*[^\n]*/gi,
+                                            /Format\s*:?\s*[^\n]*/gi,
+                                            /Codec\s*:?\s*[^\n]*/gi,
+                                            /Frame Rate\s*:?\s*[^\n]*/gi,
+                                            /--/g,  // Убираем разделители "--"
+                                        ];
+                                        let cleanedHook = hookText;
+                                        for (const pattern of metadataPatterns) {
+                                            cleanedHook = cleanedHook.replace(pattern, '');
+                                        }
+                                        cleanedHook = cleanedHook.replace(/\n{2,}/g, '\n').trim();  // Убираем множественные переносы строк
+                                        
+                                        if (cleanedHook && cleanedHook.length > 5 && cleanedHook.length < 300 &&
+                                            !cleanedHook.includes('Limited Time Offer') &&
+                                            !cleanedHook.includes('Annual Plan') &&
+                                            !cleanedHook.includes('Promotion Period') &&
+                                            !cleanedHook.includes('50% OFF') &&
+                                            !cleanedHook.toLowerCase().includes('q4') &&
+                                            !cleanedHook.toLowerCase().includes('monthly plan') &&
                                             !isFooterMenu) {
-                                            return hookText;
+                                            return cleanedHook;
                                         }
                                     }
                                 }
