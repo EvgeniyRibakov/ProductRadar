@@ -885,6 +885,175 @@ class ParserEngine:
             log.error(traceback.format_exc())
             return product_data
     
+    async def return_to_main_page(self, main_page_url: str) -> bool:
+        """
+        Возврат на главную страницу со списком товаров
+        
+        Args:
+            main_page_url: URL главной страницы (сохраненный перед переходом на товар)
+        
+        Returns:
+            True если возврат успешен, False в случае ошибки
+        """
+        try:
+            log.info("\n🔙 Возврат на главную страницу со списком товаров...")
+            
+            # Сохраняем текущий URL для проверки
+            current_url = self.page.url
+            log.info(f"  → Текущий URL: {current_url}")
+            log.info(f"  → Целевой URL: {main_page_url}")
+            
+            # Проверяем, что мы не на главной странице
+            if current_url == main_page_url:
+                log.info("  ℹ️  Уже на главной странице")
+                return True
+            
+            # МЕТОД 1: Прямой переход на сохраненный URL (самый надежный)
+            await self.page.goto(main_page_url, wait_until="domcontentloaded", timeout=15000)
+            await self.human_delay(1, 2)
+            
+            # Ждем загрузки страницы (БЕЗ networkidle - он вызывает таймауты!)
+            await self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+            
+            # Проверяем, что мы вернулись на страницу поиска
+            new_url = self.page.url
+            log.info(f"  → Новый URL: {new_url}")
+            
+            # Проверяем наличие карточек товаров
+            try:
+                await self.page.wait_for_selector('a[href*="/tiktok-shop-product/"]', timeout=5000)
+                log.info("  ✅ Возврат на главную страницу успешен")
+                return True
+            except:
+                log.warning("  ⚠️ Карточки товаров не найдены после возврата")
+                return False
+            
+        except Exception as e:
+            log.error(f"  ❌ Ошибка при возврате на главную страницу: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return False
+    
+    async def get_product_details_with_return(self, product_index: int, sheets_writer=None):
+        """
+        Обработать товар по индексу и вернуться на главную страницу
+        
+        Алгоритм:
+        1. Сохранить URL главной страницы
+        2. Кликнуть на товар по индексу
+        3. Обработать товар (get_product_details)
+        4. Вернуться на главную страницу
+        
+        Args:
+            product_index: Индекс товара на главной странице (начиная с 0)
+            sheets_writer: Объект для записи в Google Sheets
+        
+        Returns:
+            ProductData если товар обработан успешно
+            Dict со status="insufficient_videos" если недостаточно видео
+            None в случае ошибки
+        """
+        log.info(f"\n{'='*80}")
+        log.info(f"🔄 ОБРАБОТКА ТОВАРА ПО ИНДЕКСУ {product_index}")
+        log.info(f"{'='*80}")
+        
+        # Сохраняем URL главной страницы
+        main_page_url = self.page.url
+        log.info(f"  → Сохранен URL главной страницы: {main_page_url}")
+        
+        try:
+            # ШАГ 1: Клик на товар по индексу
+            log.info(f"\n📌 ШАГ 1: Клик на товар по индексу {product_index}...")
+            try:
+                # Ищем все карточки товаров
+                product_links = await self.page.query_selector_all('a[href*="/tiktok-shop-product/"]')
+                
+                if not product_links:
+                    log.error("  ❌ Карточки товаров не найдены на главной странице")
+                    return None
+                
+                if product_index >= len(product_links):
+                    log.error(f"  ❌ Индекс {product_index} выходит за пределы (всего {len(product_links)} товаров)")
+                    return None
+                
+                # Получаем элемент товара по индексу
+                product_link = product_links[product_index]
+                
+                # Получаем URL товара
+                href = await product_link.get_attribute("href")
+                if not href:
+                    log.error(f"  ❌ Не удалось получить URL для товара {product_index}")
+                    return None
+                
+                # Формируем полный URL
+                if href.startswith("/"):
+                    product_url = f"https://www.pipiads.com{href}"
+                elif href.startswith("http"):
+                    product_url = href
+                else:
+                    product_url = f"https://www.pipiads.com/{href}"
+                
+                log.info(f"  ✅ Получен URL товара: {product_url}")
+                
+            except Exception as e:
+                log.error(f"  ❌ Ошибка при получении URL товара: {e}")
+                return None
+            
+            # ШАГ 2: Обработка товара через get_product_details
+            log.info(f"\n📌 ШАГ 2: Обработка товара...")
+            product_data = await self.get_product_details(product_url, sheets_writer=sheets_writer)
+            
+            # ШАГ 3: Проверка результата (до возврата на главную)
+            log.info(f"\n📌 ШАГ 3: Проверка результата...")
+            
+            # Проверяем, что товар обработан и есть видео
+            if not product_data:
+                log.warning("  ⚠️ product_data пуст")
+                # Возвращаемся на главную даже при ошибке
+                await self.return_to_main_page(main_page_url)
+                return None
+            
+            # Проверяем количество видео
+            videos_count = len(product_data.videos) if hasattr(product_data, 'videos') else 0
+            log.info(f"  → Найдено видео: {videos_count}")
+            
+            # Если видео меньше 3 - возвращаем специальный статус
+            if videos_count < 3:
+                log.warning(f"  ⚠️ Недостаточно видео: {videos_count} < 3")
+                
+                # Возвращаемся на главную
+                await self.return_to_main_page(main_page_url)
+                
+                # Возвращаем словарь со статусом "insufficient_videos"
+                return {
+                    "status": "insufficient_videos",
+                    "product_name": getattr(product_data, 'product_name', 'N/A'),
+                    "videos_found": videos_count,
+                    "videos_required": 3,
+                    "reason": f"Найдено только {videos_count} видео после фильтрации"
+                }
+            
+            # ШАГ 4: Возврат на главную страницу
+            log.info(f"\n📌 ШАГ 4: Возврат на главную страницу...")
+            await self.return_to_main_page(main_page_url)
+            
+            # Возвращаем успешно обработанный товар
+            log.info(f"  ✅ Товар обработан успешно ({videos_count} видео)")
+            return product_data
+            
+        except Exception as e:
+            log.error(f"\n❌ ОШИБКА при обработке товара по индексу {product_index}: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            
+            # Пытаемся вернуться на главную даже при ошибке
+            try:
+                await self.return_to_main_page(main_page_url)
+            except:
+                log.error("  ❌ Не удалось вернуться на главную страницу после ошибки")
+            
+            return None
+    
     async def _set_sort_by_first_seen(self) -> bool:
         """
         Установить сортировку "First seen" в dropdown
@@ -1044,13 +1213,14 @@ class ParserEngine:
                         videos.append(video_data)
                         impression = video_data.get('impression', 0)
                         first_seen = video_data.get('first_seen', 'N/A')
+                        
+                        # ЛОГИРУЕМ КАЖДОЕ ВИДЕО (как просил пользователь)
+                        log.info(f"  📹 Видео {i}: impression={impression}, first_seen={first_seen}")
+                        
                         if impression > 0 or first_seen != 'N/A':
                             successful_extractions += 1
-                            if i <= 5:  # Логируем первые 5 для отладки
-                                log.info(f"  ✅ Видео {i}: impression={impression}, first_seen={first_seen}")
                 except Exception as e:
-                    if i <= 5:  # Логируем ошибки первых 5
-                        log.warning(f"  ⚠️ Ошибка при извлечении данных из карточки {i}: {e}")
+                    log.warning(f"  ⚠️ Ошибка при извлечении данных из карточки {i}: {e}")
                     continue
             
             log.info(f"  ✅ Извлечено {len(videos)} видео из блока (успешно распарсено: {successful_extractions})")
@@ -1079,86 +1249,59 @@ class ParserEngine:
                 "card_element": card_element,  # Сохраняем для клика
             }
             
-            # Получаем текст карточки
-            card_text = await card_element.inner_text()
-            if card_index <= 3:  # Логируем первые 3 карточки для отладки
-                log.debug(f"  → Карточка {card_index}: текст (первые 300 символов): {card_text[:300]}...")
-            
-            # Также получаем HTML для более точного поиска
+            # ========== ИЗВЛЕЧЕНИЕ IMPRESSION ==========
+            # Используем структурные селекторы на основе HTML-структуры
+            # Ищем div.data-count > div.item где caption = "Impression"
             try:
-                card_html = await card_element.inner_html()
-            except:
-                card_html = ""
-            
-            # Ищем impression в тексте - пробуем разные форматы
-            # В карточке может быть просто число типа "6.5K", "2.1M" без слова "Impression"
-            # Также ищем на русском: "Показы"
-            impression_patterns = [
-                r'Impression[:\s]+([\d.,]+[KM]?)',  # "Impression: 6.5K" (англ.)
-                r'([\d.,]+[KM]?)\s*Impression',     # "6.5K Impression" (англ.)
-                r'Impression[:\s]+([\d,]+)',        # "Impression: 6500" (англ.)
-                r'Показы[:\s]+([\d.,]+[KM]?)',      # "Показы: 6.5K" (рус.)
-                r'([\d.,]+[KM]?)\s*Показы',        # "6.5K Показы" (рус.)
-                r'Показы[:\s]+([\d,]+)',           # "Показы: 6500" (рус.)
-            ]
-            
-            # Сначала ищем с явным упоминанием "Impression" или "Показы"
-            found_impression = False
-            for pattern in impression_patterns:
-                match = re.search(pattern, card_text, re.IGNORECASE)
-                if match:
-                    impression_str = match.group(1)
-                    impression = validator.parse_impressions(impression_str)
-                    if impression and impression >= 1000:  # Минимум 1K
-                        video_data["impression"] = impression
-                        found_impression = True
-                        if card_index <= 3:
-                            log.debug(f"  → Карточка {card_index}: найдено impression через паттерн '{pattern}': {impression}")
-                        break
-            
-            # Если не нашли с "Impression"/"Показы", ищем просто большие числа (>= 1K)
-            # Но только если они выглядят как impressions (обычно самые большие числа на карточке)
-            if not found_impression:
-                matches = re.findall(r'\b([\d.,]+[KM])\b', card_text)
-                # Сортируем по убыванию значения, берем самое большое
-                impressions_found = []
-                for match_str in matches:
-                    impression = validator.parse_impressions(match_str)
-                    if impression and impression >= 1000:  # Минимум 1K
-                        impressions_found.append((impression, match_str))
+                # Ищем все блоки data-count
+                data_count_items = await card_element.query_selector_all('div.data-count div.item')
                 
-                if impressions_found:
-                    # Берем самое большое число (скорее всего это impression)
-                    impressions_found.sort(reverse=True, key=lambda x: x[0])
-                    video_data["impression"] = impressions_found[0][0]
-                    if card_index <= 3:
-                        log.debug(f"  → Карточка {card_index}: найдено impression как большое число: {impressions_found[0][0]} ({impressions_found[0][1]})")
+                for item in data_count_items:
+                    # Проверяем, что это блок с impression
+                    caption_elem = await item.query_selector('p.caption')
+                    if caption_elem:
+                        caption_text = await caption_elem.inner_text()
+                        if 'Impression' in caption_text or 'Показ' in caption_text:
+                            # Нашли нужный блок, извлекаем значение
+                            value_elem = await item.query_selector('p.value')
+                            if value_elem:
+                                impression_str = (await value_elem.inner_text()).strip()
+                                impression = validator.parse_impressions(impression_str)
+                                if impression:
+                                    video_data["impression"] = impression
+                                    # Логируем RAW-значение для отладки
+                                    log.debug(f"  → Карточка {card_index}: impression RAW='{impression_str}' → parsed={impression}")
+                                    break
+            except Exception as e:
+                if card_index <= 3:
+                    log.debug(f"  → Карточка {card_index}: ошибка при извлечении impression через селектор: {e}")
             
-            # Ищем дату first_seen (формат "Nov 02 2025-Nov 05 2025" или "Nov 02 2025")
-            # Важно: берем ПЕРВУЮ дату из диапазона
-            # Также ищем "First seen" или "Впервые замечено"
-            date_patterns = [
-                r'First\s+seen[:\s]+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})',  # "First seen: Nov 02 2025" (англ.)
-                r'Впервые\s+замечено[:\s]+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})',  # "Впервые замечено: Nov 02 2025" (рус.)
-                r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*-\s*[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}',  # "Nov 02 2025 - Nov 05 2025"
-                r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})',  # "Nov 02 2025" (любая дата)
-            ]
-            
-            for pattern in date_patterns:
-                match = re.search(pattern, card_text)
-                if match:
-                    date_str = match.group(1)
-                    # Проверяем, что это валидная дата
-                    parsed_date = validator.parse_video_date(date_str)
-                    if parsed_date:
-                        video_data["first_seen"] = date_str
-                        if card_index <= 3:
-                            log.debug(f"  → Карточка {card_index}: найдена дата first_seen: {date_str}")
-                        break
-            
-            # Ищем ссылку на ad-search
+            # ========== ИЗВЛЕЧЕНИЕ FIRST SEEN ==========
+            # Ищем div.create-time > span с датой
             try:
-                link_element = await card_element.query_selector('a[href*="/ad-search/"]')
+                create_time_elem = await card_element.query_selector('div.create-time span')
+                if create_time_elem:
+                    date_text = (await create_time_elem.inner_text()).strip()
+                    # Логируем RAW-значение
+                    log.debug(f"  → Карточка {card_index}: first_seen RAW='{date_text}'")
+                    
+                    # Формат: "Nov 05 2025-Nov 11 2025" - берем ПЕРВУЮ дату (до дефиса)
+                    # Используем regex для извлечения первой даты
+                    match = re.match(r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})', date_text)
+                    if match:
+                        first_seen_str = match.group(1)
+                        # Проверяем валидность даты
+                        parsed_date = validator.parse_video_date(first_seen_str)
+                        if parsed_date:
+                            video_data["first_seen"] = first_seen_str
+                            log.debug(f"  → Карточка {card_index}: first_seen parsed='{first_seen_str}'")
+            except Exception as e:
+                if card_index <= 3:
+                    log.debug(f"  → Карточка {card_index}: ошибка при извлечении first_seen через селектор: {e}")
+            
+            # ========== ИЗВЛЕЧЕНИЕ AD-SEARCH ССЫЛКИ ==========
+            try:
+                link_element = await card_element.query_selector('a.btn-detail[href*="/ad-search/"]')
                 if link_element:
                     href = await link_element.get_attribute("href")
                     if href:
@@ -1168,18 +1311,26 @@ class ParserEngine:
                             video_data["ad_search_url"] = href
                         else:
                             video_data["ad_search_url"] = f"https://www.pipiads.com/{href}"
-            except:
-                pass
+                        if card_index <= 3:
+                            log.debug(f"  → Карточка {card_index}: ad_search_url = {video_data['ad_search_url']}")
+            except Exception as e:
+                if card_index <= 3:
+                    log.debug(f"  → Карточка {card_index}: ошибка при извлечении ad_search_url: {e}")
             
             # Если не нашли ссылку, но есть карточка - можно будет кликнуть на неё
             if not video_data["ad_search_url"]:
-                # Сохраняем элемент для клика
                 video_data["card_element"] = card_element
+            
+            # Логируем итоговые данные для первых 3 карточек
+            if card_index <= 3:
+                log.debug(f"  → Карточка {card_index}: итого - impression={video_data['impression']}, first_seen={video_data['first_seen']}, ad_search_url={bool(video_data['ad_search_url'])}")
             
             return video_data
             
         except Exception as e:
-            log.debug(f"Ошибка при извлечении данных из карточки: {e}")
+            log.debug(f"Ошибка при извлечении данных из карточки {card_index}: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
             return None
     
     async def _filter_videos(self, videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2275,11 +2426,47 @@ class ParserEngine:
             return None
     
     async def _extract_audience(self) -> Optional[Dict[str, str]]:
-        """Извлечь возраст и платформу из поля Audience/Аудитория в формате 'Аудитория: Возраст: 25-35 | Устройство: Android'"""
+        """
+        Извлечь возраст из поля Audience
+        
+        Структура HTML:
+        <div class="addel-info-item">
+            <div class="name"> Audience </div>
+            <div class="value">
+                <div class="audience-info">
+                    <div class="audience-info-info">45-55 ... Android...</div>
+                </div>
+            </div>
+        </div>
+        """
         try:
             audience_data = {"age": "N/A", "platform": "N/A"}
             
-            # Метод 1: Поиск через локаторы
+            # МЕТОД 1: Структурный поиск через селекторы (самый надежный)
+            try:
+                # Ищем блок с названием "Audience"
+                audience_items = await self.page.query_selector_all('div.addel-info-item')
+                
+                for item in audience_items:
+                    # Проверяем, что это блок с Audience
+                    name_elem = await item.query_selector('div.name')
+                    if name_elem:
+                        name_text = await name_elem.inner_text()
+                        if 'Audience' in name_text or 'Аудитория' in name_text:
+                            # Нашли нужный блок, извлекаем текст из audience-info-info
+                            audience_info = await item.query_selector('div.audience-info-info')
+                            if audience_info:
+                                text = await audience_info.inner_text()
+                                # Извлекаем возраст в формате "45-55" (может быть 2 цифры)
+                                age_match = re.search(r'(\d{1,2}-\d{1,2})', text)
+                                if age_match:
+                                    audience_data["age"] = age_match.group(1)
+                                    log.debug(f"      → Audience age найден через структурный селектор: {audience_data['age']}")
+                                    return audience_data
+            except Exception as e:
+                log.debug(f"      → Ошибка при структурном поиске audience: {e}")
+            
+            # МЕТОД 2: Fallback через локаторы (если структурный не сработал)
             audience_keywords = ["Audience", "Аудитория", "Target Audience", "Целевая аудитория"]
             
             for keyword in audience_keywords:
@@ -2289,7 +2476,7 @@ class ParserEngine:
                         # Ищем текст аудитории рядом
                         text = await locator.locator("..").inner_text()
                         
-                        # Ищем возраст в формате "Возраст: 25-35" или просто "25-35"
+                        # Ищем возраст в формате "25-35" или "45-55"
                         age_patterns = [
                             r'Возраст[:\s]+(\d{1,2}-\d{1,2})',
                             r'Age[:\s]+(\d{1,2}-\d{1,2})',
@@ -2300,27 +2487,10 @@ class ParserEngine:
                             age_match = re.search(pattern, text, re.IGNORECASE)
                             if age_match:
                                 audience_data["age"] = age_match.group(1)
+                                log.debug(f"      → Audience age найден через локатор: {audience_data['age']}")
                                 break
                         
-                        # Ищем платформу в формате "Устройство: Android" или "| Android"
-                        platform_patterns = [
-                            r'Устройство[:\s]+(Android|iOS)',
-                            r'Device[:\s]+(Android|iOS)',
-                            r'\|\s*(Android|iOS)',
-                            r'(Android|iOS)',
-                        ]
-                        
-                        for pattern in platform_patterns:
-                            platform_match = re.search(pattern, text, re.IGNORECASE)
-                            if platform_match:
-                                platform = platform_match.group(1)
-                                if platform.lower() in ["ios", "iphone", "ipad"]:
-                                    audience_data["platform"] = "iOS"
-                                else:
-                                    audience_data["platform"] = "Android"
-                                break
-                        
-                        if audience_data["age"] != "N/A" or audience_data["platform"] != "N/A":
+                        if audience_data["age"] != "N/A":
                             return audience_data
                 except:
                     continue

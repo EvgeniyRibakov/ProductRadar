@@ -46,9 +46,9 @@ GOOGLE_SHEETS_SHEET_NAME = os.getenv(
 GOOGLE_CREDENTIALS_PATH = CONFIG_DIR / "google-credentials.json"
 
 # Параметры фильтрации видео
-MIN_IMPRESSIONS = int(os.getenv("MIN_IMPRESSIONS", "50000"))
+MIN_IMPRESSIONS = int(os.getenv("MIN_IMPRESSIONS", "5000"))  # Минимум 5K impressions
 PRIORITY_IMPRESSIONS = int(os.getenv("PRIORITY_IMPRESSIONS", "100000"))
-DAYS_BACK = int(os.getenv("DAYS_BACK", "14"))  # Последние 14 дней
+DAYS_BACK = int(os.getenv("DAYS_BACK", "30"))  # Видео не старше 30 дней
 
 # Настройки браузера
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() == "true"
