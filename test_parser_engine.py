@@ -96,16 +96,18 @@ async def test_parser_engine():
         successful_products = 0  # Счетчик успешно обработанных товаров
         checked_products = 0      # Счетчик проверенных товаров
         skipped_products = []     # Список пропущенных товаров
-        banned_product_ids = set()  # Ban-list: product_id товаров, которые уже обрабатывались
+        banned_products = set()   # Ban-list: URL товаров, которые уже обрабатывались (нормализованные)
         all_products_analytics = []  # Аналитика ВСЕХ товаров для summary-файла
         
-        def extract_product_id(url: str) -> str:
-            """Извлечь product_id из URL"""
-            # https://www.pipiads.com/tiktok-shop-product/1729732622305364547/
-            # → 1729732622305364547
-            url_normalized = url.rstrip('/')
-            parts = url_normalized.split('/')
-            return parts[-1] if parts else ""
+        def normalize_url(url: str) -> str:
+            """Нормализовать URL (убрать слэш в конце, привести к единому виду)"""
+            if not url:
+                return ""
+            url = url.strip().rstrip('/')
+            # Убираем параметры запроса если есть
+            if '?' in url:
+                url = url.split('?')[0]
+            return url
         
         # Главный цикл обработки
         while successful_products < MIN_PRODUCTS_TO_COLLECT and checked_products < MAX_PRODUCTS_TO_CHECK:
@@ -129,37 +131,34 @@ async def test_parser_engine():
             
             log.info(f"✅ Получено {len(products)} товаров на текущей странице")
             
-            # 7.1.5. Дополнительная дедупликация по product_id (на случай если get_products_from_search_page вернул дубликаты)
-            # ВАЖНО: Используем banned_product_ids для проверки, чтобы не обрабатывать товары, которые уже были обработаны
+            # 7.1.5. Дедупликация по URL (простая и надежная)
+            # ВАЖНО: Используем banned_products для проверки, чтобы не обрабатывать товары, которые уже были обработаны
             unique_products = []
             duplicate_count = 0
+            seen_urls = set()  # Для дедупликации внутри текущего списка
             
             for product in products:
-                product_url = product.get('url', '').rstrip('/')
-                product_id = product.get('product_id') or extract_product_id(product_url)
+                product_url = normalize_url(product.get('url', ''))
                 
-                if not product_id:
-                    log.warning(f"⚠️ Пропуск товара без product_id: {product_url}")
+                if not product_url:
+                    log.warning(f"⚠️ Пропуск товара без URL")
                     continue
                 
-                # Проверяем против banned_product_ids (уже обработанные товары)
-                if product_id in banned_product_ids:
+                # Проверяем против banned_products (уже обработанные товары)
+                if product_url in banned_products:
                     duplicate_count += 1
-                    log.info(f"⏭️  Дубликат товара пропущен (уже в ban-list, product_id={product_id}): {product_url}")
+                    log.info(f"⏭️  Дубликат товара пропущен (уже в ban-list): {product_url}")
                     continue
                 
                 # Проверяем на дубликаты внутри текущего списка
-                # (если один товар встречается несколько раз в одном списке)
-                is_duplicate_in_list = any(
-                    (p.get('product_id') or extract_product_id(p.get('url', '').rstrip('/'))) == product_id
-                    for p in unique_products
-                )
-                
-                if is_duplicate_in_list:
+                if product_url in seen_urls:
                     duplicate_count += 1
-                    log.info(f"⏭️  Дубликат товара пропущен (в текущем списке, product_id={product_id}): {product_url}")
+                    log.info(f"⏭️  Дубликат товара пропущен (в текущем списке): {product_url}")
                     continue
                 
+                seen_urls.add(product_url)
+                # Обновляем URL в словаре товара на нормализованный
+                product['url'] = product_url
                 unique_products.append(product)
             
             if duplicate_count > 0:
@@ -182,22 +181,17 @@ async def test_parser_engine():
                     break
                 
                 # ⚠️ ПРОВЕРКА BAN-LIST: пропускаем товары, которые уже обрабатывались
-                product_url = product.get('url', '').rstrip('/')  # Убираем слэш в конце
-                product_id = product.get('product_id') or extract_product_id(product_url)
+                product_url = normalize_url(product.get('url', ''))
                 
-                if not product_id:
-                    log.warning(f"⚠️ Не удалось извлечь product_id из URL: {product_url}, пропускаем")
+                if not product_url:
+                    log.warning(f"⚠️ Не удалось нормализовать URL товара, пропускаем")
                     continue
                 
                 # КРИТИЧНО: Проверяем ban-list ПЕРЕД обработкой
-                if product_id in banned_product_ids:
-                    log.warning(f"🚫 ПРОПУСК: Товар уже в ban-list (product_id={product_id}): {product_url}")
+                if product_url in banned_products:
+                    log.warning(f"🚫 ПРОПУСК: Товар уже в ban-list: {product_url}")
                     log.warning(f"   Это дубликат! Пропускаем обработку.")
                     continue
-                
-                # Отмечаем товар как обработанный СРАЗУ (до клика) - чтобы не обработать дважды
-                banned_product_ids.add(product_id)
-                log.info(f"   ✅ Добавлен в ban-list ПЕРЕД обработкой: product_id={product_id}, url={product_url}")
                 
                 checked_products += 1
                 
@@ -208,17 +202,20 @@ async def test_parser_engine():
                 log.info(f"{'='*80}")
                 log.info(f"Название: {product.get('name', 'N/A')[:70]}...")
                 log.info(f"Категория: {product.get('category', 'N/A')}")
-                log.info(f"URL: {product.get('url', 'N/A')}")
-                log.info(f"Product ID: {product_id}")
+                log.info(f"URL: {product_url}")
                 
                 try:
-                    # 7.3. Обработка товара (клик по индексу, переход на страницу товара)
-                    # ВАЖНО: Передаем banned_product_ids для дополнительной проверки дубликатов
+                    # 7.3. Обработка товара (переход на страницу товара по URL)
+                    # ВАЖНО: Передаем banned_products для дополнительной проверки дубликатов
                     product_data = await parser.get_product_details_with_return(
-                        product_index=product_index,
+                        product_url=product_url,
                         sheets_writer=sheets_writer,
-                        banned_product_ids=banned_product_ids
+                        banned_products=banned_products
                     )
+                    
+                    # КРИТИЧНО: Добавляем товар в ban-list ПОСЛЕ обработки (независимо от результата)
+                    banned_products.add(product_url)
+                    log.info(f"   ✅ Добавлен в ban-list ПОСЛЕ обработки: {product_url}")
                     
                     # 7.4. Проверка результата
                     if product_data is None:
@@ -243,7 +240,8 @@ async def test_parser_engine():
                     
                     # Проверка на дубликат (если вернулся статус "duplicate")
                     if isinstance(product_data, dict) and product_data.get("status") == "duplicate":
-                        log.warning(f"🚫 ПРОПУСК: Товар уже обработан (дубликат, product_id={product_data.get('product_id')})")
+                        duplicate_url = product_data.get('product_url', 'N/A')
+                        log.warning(f"🚫 ПРОПУСК: Товар уже обработан (дубликат): {duplicate_url}")
                         duplicate_count += 1
                         continue
                     
@@ -335,6 +333,10 @@ async def test_parser_engine():
                     import traceback
                     log.error(traceback.format_exc())
                     
+                    # Добавляем в ban-list даже при ошибке, чтобы не обрабатывать повторно
+                    banned_products.add(product_url)
+                    log.info(f"   ✅ Добавлен в ban-list после ошибки: {product_url}")
+                    
                     skipped_products.append({
                         "name": product.get('name', 'N/A'),
                         "reason": f"Исключение: {str(e)[:50]}",
@@ -355,14 +357,14 @@ async def test_parser_engine():
         log.info(f"✅ Успешно обработано товаров: {successful_products}")
         log.info(f"⏭️  Пропущено товаров: {len(skipped_products)}")
         log.info(f"🔍 Всего проверено товаров: {checked_products}")
-        log.info(f"🚫 Товаров в ban-list: {len(banned_product_ids)}")
+        log.info(f"🚫 Товаров в ban-list: {len(banned_products)}")
         log.info(f"{'='*80}")
         
         # Вывод ban-list
-        if banned_product_ids:
-            log.info(f"\n🚫 BAN-LIST (обработанные product_id):")
-            for i, product_id in enumerate(sorted(banned_product_ids), 1):
-                log.info(f"   {i}. {product_id}")
+        if banned_products:
+            log.info(f"\n🚫 BAN-LIST (обработанные товары):")
+            for i, product_url in enumerate(sorted(banned_products), 1):
+                log.info(f"   {i}. {product_url}")
         
         if skipped_products:
             log.info(f"\n⏭️  СПИСОК ПРОПУЩЕННЫХ ТОВАРОВ:")
@@ -398,7 +400,7 @@ async def test_parser_engine():
                 f.write(f"- **Успешно обработано:** {successful_products} товаров\n")
                 f.write(f"- **Пропущено:** {len(skipped_products)} товаров\n")
                 f.write(f"- **Проверено:** {checked_products} товаров\n")
-                f.write(f"- **Ban-list:** {len(banned_product_ids)} товаров\n\n")
+                f.write(f"- **Ban-list:** {len(banned_products)} товаров\n\n")
                 
                 if successful_products > 0:
                     f.write("### 🎉 SUCCESS\n\n")
@@ -450,10 +452,10 @@ async def test_parser_engine():
                         f.write(f"   - Видео найдено: {skipped['videos_found']}\n\n")
                 
                 # Ban-list
-                if banned_product_ids:
-                    f.write("### 🚫 Ban-list (обработанные product_id)\n\n")
-                    for i, product_id in enumerate(sorted(banned_product_ids), 1):
-                        f.write(f"{i}. `{product_id}`\n")
+                if banned_products:
+                    f.write("### 🚫 Ban-list (обработанные товары)\n\n")
+                    for i, product_url in enumerate(sorted(banned_products), 1):
+                        f.write(f"{i}. `{product_url}`\n")
                     f.write("\n")
                 
                 f.write("## 🔍 Технические детали\n\n")

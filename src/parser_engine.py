@@ -1041,44 +1041,62 @@ class ParserEngine:
             log.error(traceback.format_exc())
             return False
     
-    async def get_product_details_with_return(self, product_index: int, sheets_writer=None, banned_product_ids=None):
+    async def get_product_details_with_return(self, product_url: str, sheets_writer=None, banned_products=None):
         """
-        Обработать товар по индексу и вернуться на главную страницу
+        Обработать товар по URL и вернуться на главную страницу
         
         Алгоритм:
         1. Сохранить URL главной страницы
-        2. Кликнуть на товар по индексу
+        2. Найти товар на странице по URL и кликнуть
         3. Проверить ban-list (если передан)
         4. Обработать товар (get_product_details)
         5. Вернуться на главную страницу
         
         Args:
-            product_index: Индекс товара на главной странице (начиная с 0)
+            product_url: URL товара (нормализованный)
             sheets_writer: Объект для записи в Google Sheets
-            banned_product_ids: Множество уже обработанных product_id (для проверки дубликатов)
+            banned_products: Множество уже обработанных URL (нормализованных) для проверки дубликатов
         
         Returns:
             ProductData если товар обработан успешно
             Dict со status="insufficient_videos" если недостаточно видео
+            Dict со status="duplicate" если товар уже обработан
             None в случае ошибки
         """
         log.info(f"\n{'='*80}")
-        log.info(f"🔄 ОБРАБОТКА ТОВАРА ПО ИНДЕКСУ {product_index}")
+        log.info(f"🔄 ОБРАБОТКА ТОВАРА: {product_url}")
         log.info(f"{'='*80}")
         
         # Сохраняем URL главной страницы
         main_page_url = self.page.url
         log.info(f"  → Сохранен URL главной страницы: {main_page_url}")
         
+        def normalize_url(url: str) -> str:
+            """Нормализовать URL (убрать слэш в конце, привести к единому виду)"""
+            if not url:
+                return ""
+            url = url.strip().rstrip('/')
+            # Убираем параметры запроса если есть
+            if '?' in url:
+                url = url.split('?')[0]
+            return url
+        
         try:
-            # ШАГ 1: Клик на товар по индексу
-            log.info(f"\n📌 ШАГ 1: Клик на товар по индексу {product_index}...")
+            # Нормализуем URL товара
+            product_url = normalize_url(product_url)
             
-            def extract_product_id(url: str) -> str:
-                """Извлечь product_id из URL"""
-                url_normalized = url.rstrip('/')
-                parts = url_normalized.split('/')
-                return parts[-1] if parts else ""
+            if not product_url:
+                log.warning(f"  ⚠️ Не удалось нормализовать URL товара, пропускаем")
+                return None
+            
+            # КРИТИЧНО: Проверяем ban-list ПЕРЕД обработкой
+            if banned_products is not None and product_url in banned_products:
+                log.warning(f"  🚫 ПРОПУСК: Товар уже в ban-list: {product_url}")
+                log.warning(f"     Это дубликат! Пропускаем обработку.")
+                return {"status": "duplicate", "product_url": product_url}
+            
+            # ШАГ 1: Найти товар на странице по URL и кликнуть
+            log.info(f"\n📌 ШАГ 1: Поиск товара на странице по URL...")
             
             try:
                 # Ищем все карточки товаров
@@ -1088,47 +1106,49 @@ class ParserEngine:
                     log.error("  ❌ Карточки товаров не найдены на главной странице")
                     return None
                 
-                if product_index >= len(product_links):
-                    log.error(f"  ❌ Индекс {product_index} выходит за пределы (всего {len(product_links)} товаров)")
+                # Ищем товар по URL (проверяем нормализованные URL)
+                product_link = None
+                for link in product_links:
+                    href = await link.get_attribute("href")
+                    if not href:
+                        continue
+                    
+                    # Формируем полный URL
+                    if href.startswith("/"):
+                        link_url = f"https://www.pipiads.com{href}"
+                    elif href.startswith("http"):
+                        link_url = href
+                    else:
+                        link_url = f"https://www.pipiads.com/{href}"
+                    
+                    # Нормализуем URL ссылки
+                    link_url = normalize_url(link_url)
+                    
+                    if link_url == product_url:
+                        product_link = link
+                        break
+                
+                if not product_link:
+                    log.error(f"  ❌ Товар с URL {product_url} не найден на главной странице")
                     return None
                 
-                # Получаем элемент товара по индексу
-                product_link = product_links[product_index]
+                log.info(f"  ✅ Товар найден на странице: {product_url}")
                 
-                # Получаем URL товара
-                href = await product_link.get_attribute("href")
-                if not href:
-                    log.error(f"  ❌ Не удалось получить URL для товара {product_index}")
-                    return None
+                # Кликаем на товар
+                log.info("  → Клик на товар...")
+                await product_link.click()
+                await self.human_delay(1, 2)
+                log.info("  ✅ Клик выполнен, ожидание загрузки страницы товара...")
                 
-                # Формируем полный URL
-                if href.startswith("/"):
-                    product_url = f"https://www.pipiads.com{href}"
-                elif href.startswith("http"):
-                    product_url = href
-                else:
-                    product_url = f"https://www.pipiads.com/{href}"
-                
-                # Нормализуем URL (убираем слэш в конце)
-                product_url = product_url.rstrip('/')
-                
-                # Извлекаем product_id для проверки дубликатов
-                product_id = extract_product_id(product_url)
-                
-                if not product_id:
-                    log.warning(f"  ⚠️ Не удалось извлечь product_id из URL: {product_url}, пропускаем")
-                    return None
-                
-                # КРИТИЧНО: Проверяем ban-list ПЕРЕД обработкой
-                if banned_product_ids is not None and product_id in banned_product_ids:
-                    log.warning(f"  🚫 ПРОПУСК: Товар уже в ban-list (product_id={product_id}): {product_url}")
-                    log.warning(f"     Это дубликат! Пропускаем обработку.")
-                    return {"status": "duplicate", "product_id": product_id}
-                
-                log.info(f"  ✅ Получен URL товара: {product_url} (product_id: {product_id})")
+                # Ждем загрузки страницы товара
+                await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                await self.human_delay(1, 2)
+                log.info("  ✅ Страница товара загружена")
                 
             except Exception as e:
-                log.error(f"  ❌ Ошибка при получении URL товара: {e}")
+                log.error(f"  ❌ Ошибка при поиске/клике на товар: {e}")
+                import traceback
+                log.error(traceback.format_exc())
                 return None
             
             # ШАГ 2: Обработка товара через get_product_details
@@ -1559,20 +1579,23 @@ class ParserEngine:
             filtered.append(video)
         
         # Сортировка: сначала по дате (самые недавние), потом по impressions (самые большие)
-        # Убираем дубликаты по tiktok_link, ad_search_url или комбинации impression+first_seen
+        # Убираем дубликаты по ad_search_url (самый надежный), затем tiktok_link, затем комбинация
         seen_videos = set()
         unique_videos = []
         for video in filtered:
-            # Используем несколько способов определения уникальности
-            # 1. tiktok_link (самый надежный)
-            # 2. ad_search_url (если есть)
+            # Используем несколько способов определения уникальности (в порядке приоритета)
+            # 1. ad_search_url (самый надежный - уникальный для каждого видео)
+            # 2. tiktok_link (если ad_search_url нет)
             # 3. Комбинация impression + first_seen (fallback)
             video_id = None
             
-            if video.get("tiktok_link") and video.get("tiktok_link") != "N/A":
+            # Нормализуем ad_search_url (убираем слэш в конце)
+            ad_search_url = video.get("ad_search_url", "")
+            if ad_search_url and ad_search_url != "N/A":
+                ad_search_url = ad_search_url.rstrip('/')
+                video_id = f"ad_search:{ad_search_url}"
+            elif video.get("tiktok_link") and video.get("tiktok_link") != "N/A":
                 video_id = f"tiktok:{video.get('tiktok_link')}"
-            elif video.get("ad_search_url") and video.get("ad_search_url") != "N/A":
-                video_id = f"ad_search:{video.get('ad_search_url')}"
             else:
                 # Fallback: используем комбинацию impression + first_seen
                 impression = video.get("impression", 0)
@@ -1583,7 +1606,7 @@ class ParserEngine:
                 seen_videos.add(video_id)
                 unique_videos.append(video)
             else:
-                log.debug(f"Видео пропущено как дубликат: {video_id}")
+                log.info(f"⏭️  Видео пропущено как дубликат: {video_id}")
         
         # Сортируем: сначала по дате (самые недавние), потом по impressions (самые большие)
         def sort_key(v):
@@ -1686,23 +1709,26 @@ class ParserEngine:
             # Передаем исходные данные видео (impressions из карточки) для fallback
             log.info("    → Извлечение данных со страницы ad-search...")
             
-            # ВАЖНО: Ждем полной загрузки страницы и появления ключевых элементов перед извлечением данных
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=15000)
-                await self.human_delay(1, 2)  # Дополнительная задержка для загрузки контента
-                log.info("    ✅ Страница ad-search полностью загружена (networkidle)")
-            except:
-                log.warning("    ⚠️ Таймаут networkidle, продолжаем с domcontentloaded...")
-                await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
-                await self.human_delay(2, 3)  # Увеличена задержка
+            # ВАЖНО: Ждем загрузки страницы и появления ключевых элементов
+            # Используем domcontentloaded (быстрее) + задержка + ожидание элементов
+            await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+            await self.human_delay(2, 3)  # Задержка для загрузки динамического контента
             
-            # Ждем появления ключевых элементов (Script, Hook, Audience)
-            try:
-                # Пробуем найти хотя бы один из ключевых элементов
-                await self.page.wait_for_selector('li#ai-script, li#ai-hook, div.addel-info-item', timeout=10000, state="visible")
-                log.info("    ✅ Ключевые элементы найдены на странице ad-search")
-            except:
-                log.warning("    ⚠️ Ключевые элементы не найдены, продолжаем извлечение...")
+            # Ждем появления ключевых элементов (Script, Hook, Audience) с retry
+            elements_found = False
+            for attempt in range(3):  # 3 попытки
+                try:
+                    # Пробуем найти хотя бы один из ключевых элементов
+                    await self.page.wait_for_selector('li#ai-script, li#ai-hook, div.addel-info-item', timeout=5000, state="visible")
+                    log.info(f"    ✅ Ключевые элементы найдены на странице ad-search (попытка {attempt + 1})")
+                    elements_found = True
+                    break
+                except:
+                    if attempt < 2:
+                        log.debug(f"    → Попытка {attempt + 1}: элементы не найдены, ждем еще...")
+                        await self.human_delay(2, 3)
+                    else:
+                        log.warning("    ⚠️ Ключевые элементы не найдены после 3 попыток, продолжаем извлечение...")
             
             return await self._extract_ad_search_data(video)
             
@@ -2057,23 +2083,40 @@ class ParserEngine:
         """
         try:
             # МЕТОД 0: Прямой поиск по селектору из документации (самый надежный)
-            try:
-                # Сначала ждем появления элемента
+            # Пробуем несколько раз с ожиданием (элементы могут загружаться динамически)
+            for attempt in range(3):
                 try:
-                    await self.page.wait_for_selector('li#ai-script', timeout=5000, state="visible")
-                except:
-                    log.debug(f"      → Элемент li#ai-script не появился за 5 секунд")
-                
-                script_element = await self.page.query_selector('li#ai-script p.content-text')
-                if script_element:
-                    script = await script_element.inner_text()
-                    if script and len(script.strip()) > 10:
-                        log.info(f"      ✅ Script найден через селектор li#ai-script p.content-text ({len(script)} символов)")
-                        return script.strip()
-                else:
-                    log.debug(f"      → Элемент li#ai-script p.content-text не найден")
-            except Exception as e:
-                log.debug(f"      → Селектор li#ai-script не сработал: {e}")
+                    # Ждем появления элемента
+                    try:
+                        await self.page.wait_for_selector('li#ai-script', timeout=5000, state="visible")
+                    except:
+                        if attempt < 2:
+                            log.debug(f"      → Попытка {attempt + 1}: элемент li#ai-script не появился, ждем еще...")
+                            await self.human_delay(1, 2)
+                            continue
+                        else:
+                            log.debug(f"      → Элемент li#ai-script не появился за 15 секунд")
+                    
+                    script_element = await self.page.query_selector('li#ai-script p.content-text')
+                    if script_element:
+                        script = await script_element.inner_text()
+                        if script and len(script.strip()) > 10:
+                            log.info(f"      ✅ Script найден через селектор li#ai-script p.content-text ({len(script)} символов)")
+                            return script.strip()
+                    else:
+                        if attempt < 2:
+                            log.debug(f"      → Попытка {attempt + 1}: элемент p.content-text не найден, ждем еще...")
+                            await self.human_delay(1, 2)
+                            continue
+                        else:
+                            log.debug(f"      → Элемент li#ai-script p.content-text не найден")
+                except Exception as e:
+                    if attempt < 2:
+                        log.debug(f"      → Попытка {attempt + 1}: ошибка {e}, пробуем еще раз...")
+                        await self.human_delay(1, 2)
+                        continue
+                    else:
+                        log.debug(f"      → Селектор li#ai-script не сработал: {e}")
             
             # Метод 1: Поиск через локаторы (английский и русский)
             script_keywords = ["Script", "Сценарий", "Transcript", "Анализ транскрипта", "Транскрипт"]
@@ -2304,23 +2347,40 @@ class ParserEngine:
         """
         try:
             # МЕТОД 0: Прямой поиск по селектору из документации (самый надежный)
-            try:
-                # Сначала ждем появления элемента
+            # Пробуем несколько раз с ожиданием (элементы могут загружаться динамически)
+            for attempt in range(3):
                 try:
-                    await self.page.wait_for_selector('li#ai-hook', timeout=5000, state="visible")
-                except:
-                    log.debug(f"      → Элемент li#ai-hook не появился за 5 секунд")
-                
-                hook_element = await self.page.query_selector('li#ai-hook p.content-text')
-                if hook_element:
-                    hook = await hook_element.inner_text()
-                    if hook and len(hook.strip()) > 5:
-                        log.info(f"      ✅ Hook найден через селектор li#ai-hook p.content-text ({len(hook)} символов)")
-                        return hook.strip()
-                else:
-                    log.debug(f"      → Элемент li#ai-hook p.content-text не найден")
-            except Exception as e:
-                log.debug(f"      → Селектор li#ai-hook не сработал: {e}")
+                    # Ждем появления элемента
+                    try:
+                        await self.page.wait_for_selector('li#ai-hook', timeout=5000, state="visible")
+                    except:
+                        if attempt < 2:
+                            log.debug(f"      → Попытка {attempt + 1}: элемент li#ai-hook не появился, ждем еще...")
+                            await self.human_delay(1, 2)
+                            continue
+                        else:
+                            log.debug(f"      → Элемент li#ai-hook не появился за 15 секунд")
+                    
+                    hook_element = await self.page.query_selector('li#ai-hook p.content-text')
+                    if hook_element:
+                        hook = await hook_element.inner_text()
+                        if hook and len(hook.strip()) > 5:
+                            log.info(f"      ✅ Hook найден через селектор li#ai-hook p.content-text ({len(hook)} символов)")
+                            return hook.strip()
+                    else:
+                        if attempt < 2:
+                            log.debug(f"      → Попытка {attempt + 1}: элемент p.content-text не найден, ждем еще...")
+                            await self.human_delay(1, 2)
+                            continue
+                        else:
+                            log.debug(f"      → Элемент li#ai-hook p.content-text не найден")
+                except Exception as e:
+                    if attempt < 2:
+                        log.debug(f"      → Попытка {attempt + 1}: ошибка {e}, пробуем еще раз...")
+                        await self.human_delay(1, 2)
+                        continue
+                    else:
+                        log.debug(f"      → Селектор li#ai-hook не сработал: {e}")
             
             # НОВЫЙ МЕТОД: Ищем Script, затем ищем Hook в следующем элементе/секции
             try:
