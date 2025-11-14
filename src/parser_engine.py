@@ -98,12 +98,20 @@ class ParserEngine:
             ]
             
             products = []
-            product_links = set()  # Для избежания дубликатов
+            product_ids = set()  # Для избежания дубликатов по product_id
+            
+            def extract_product_id(url: str) -> str:
+                """Извлечь product_id из URL"""
+                # https://www.pipiads.com/tiktok-shop-product/1729732622305364547/
+                # → 1729732622305364547
+                url_normalized = url.rstrip('/')
+                parts = url_normalized.split('/')
+                return parts[-1] if parts else ""
             
             for selector in product_selectors:
                 try:
                     elements = await self.page.query_selector_all(selector)
-                    log.debug(f"Найдено {len(elements)} элементов с селектором {selector}")
+                    log.info(f"🔍 Найдено {len(elements)} элементов с селектором '{selector}'")
                     
                     for element in elements:
                         if len(products) >= count:
@@ -127,10 +135,23 @@ class ParserEngine:
                                 else:
                                     url = f"https://www.pipiads.com/{href}"
                                 
-                                # Проверяем, что это новый товар
-                                if url in product_links:
+                                # Нормализуем URL (убираем слэш в конце)
+                                url = url.rstrip('/')
+                                
+                                # Извлекаем product_id для дедупликации
+                                product_id = extract_product_id(url)
+                                
+                                if not product_id:
+                                    log.warning(f"⚠️ Не удалось извлечь product_id из URL: {url}")
                                     continue
-                                product_links.add(url)
+                                
+                                # Проверяем, что это новый товар (по product_id)
+                                if product_id in product_ids:
+                                    log.info(f"⏭️  Пропуск дубликата (product_id={product_id}): {url}")
+                                    continue
+                                
+                                product_ids.add(product_id)
+                                log.info(f"   ✅ Добавлен товар #{len(products) + 1}: product_id={product_id}, url={url}")
                                 
                                 # Пробуем получить название товара
                                 name = ""
@@ -170,13 +191,14 @@ class ParserEngine:
                                     except:
                                         continue
                                 
-                                if url:
+                                if url and product_id:
                                     products.append({
                                         "name": name.strip() if name else "N/A",
                                         "category": category.strip() if category else "N/A",
-                                        "url": url
+                                        "url": url,
+                                        "product_id": product_id  # Добавляем product_id для удобства
                                     })
-                                    log.info(f"Найден товар {len(products)}: {name[:50] if name else 'N/A'}...")
+                                    log.info(f"   📦 Товар {len(products)}: {name[:50] if name else 'N/A'}... (ID: {product_id})")
                                 
                         except Exception as e:
                             log.debug(f"Ошибка при обработке элемента: {e}")
@@ -840,6 +862,18 @@ class ParserEngine:
             filtered_videos = await self._filter_videos(videos)
             log.info(f"  → После фильтрации: {len(filtered_videos)} видео")
             
+            # Сохраняем ВСЕ видео (для аналитики) в ProductData
+            product_data._all_videos_raw = videos[:20]  # Сохраняем первые 20 для аналитики
+            
+            # ВАЖНО: Если после фильтрации 0 видео - пропускаем товар
+            if len(filtered_videos) == 0:
+                log.warning(f"  ⚠️ После фильтрации не осталось подходящих видео (>= {config.MIN_IMPRESSIONS} impressions, <= {config.DAYS_BACK} дней)")
+                log.warning(f"  ⚠️ Товар будет пропущен")
+                # Возвращаем специальный статус для пропуска товара
+                product_data._insufficient_videos = True
+                product_data._videos_found = len(videos)
+                return product_data
+            
             # Выбор топ-3 видео
             video_count = 3
             selected_videos = filtered_videos[:video_count]
@@ -848,15 +882,40 @@ class ParserEngine:
             
             # ШАГ 8: Получение детальных метрик для каждого видео
             log.info(f"\n📌 ШАГ 8: Получение детальных метрик для {len(selected_videos)} видео...")
+            
+            # Сохраняем URL страницы товара для возврата после каждого видео
+            product_page_url = self.page.url
+            log.info(f"  → Сохранен URL страницы товара: {product_page_url}")
+            
             for i, video in enumerate(selected_videos, 1):
                 log.info(f"\n  🎬 Обработка видео {i}/{len(selected_videos)}...")
                 log.info(f"    → Impression: {video.get('impression', 0)}, First seen: {video.get('first_seen', 'N/A')}")
+                
+                # Обработка видео (переход на ad-search и извлечение данных)
                 video_details = await self._get_video_details(video)
+                
                 if video_details:
                     product_data.videos.append(video_details)
                     log.info(f"    ✅ Видео {i} обработано успешно")
                 else:
                     log.warning(f"    ⚠️ Не удалось получить детали для видео {i}")
+                
+                # ВАЖНО: Возврат на страницу товара после обработки каждого видео
+                log.info(f"    → Возврат на страницу товара после обработки видео {i}...")
+                try:
+                    await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
+                    await self.human_delay(1, 2)
+                    
+                    # Ждем загрузки блока TikTok Ads (чтобы можно было обработать следующее видео)
+                    try:
+                        await self.page.wait_for_selector('a[href*="/ad-search/"]', timeout=10000, state="visible")
+                        log.info(f"    ✅ Возврат на страницу товара успешен (видео {i})")
+                    except:
+                        log.warning(f"    ⚠️ Блок TikTok Ads не найден после возврата, продолжаем...")
+                except Exception as e:
+                    log.error(f"    ❌ Ошибка при возврате на страницу товара: {e}")
+                    # Продолжаем обработку следующих видео даже при ошибке возврата
+                
                 await self.human_delay(0.5, 1)
             
             # Заполняем N/A для отсутствующих видео (нужно 3 видео)
@@ -872,6 +931,50 @@ class ParserEngine:
                 })
             
             log.info(f"\n✅ Обработано {len(product_data.videos)} видео для товара")
+            
+            # ШАГ 9: Запись данных видео в Google Sheets (если sheets_writer передан)
+            if sheets_writer:
+                if hasattr(product_data, '_sheets_row') and product_data._sheets_row > 0:
+                    log.info(f"\n📌 ШАГ 9: Запись данных видео в Google Sheets (строка {product_data._sheets_row})...")
+                    log.info(f"  → Количество видео для записи: {len(product_data.videos)}")
+                    
+                    # Логируем данные каждого видео перед записью
+                    for i, video in enumerate(product_data.videos[:3], 1):
+                        log.info(f"  → Видео {i}: tiktok={video.get('tiktok_link', 'N/A')[:50]}, "
+                                f"impression={video.get('impression', 'N/A')}, "
+                                f"script={len(str(video.get('script', 'N/A')))} символов, "
+                                f"hook={len(str(video.get('hook', 'N/A')))} символов, "
+                                f"audience={video.get('audience_age', 'N/A')}, "
+                                f"country={video.get('country', 'N/A')}, "
+                                f"first_seen={video.get('first_seen', 'N/A')}")
+                    
+                    try:
+                        # Подготавливаем данные для записи
+                        video_data_dict = {
+                            "product_name": product_data.product_name,
+                            "category": product_data.category,
+                            "pipiads_link": product_data.pipiads_link,
+                            "videos": product_data.videos
+                        }
+                        
+                        # Записываем данные видео (update_basic=False - обновляем только видео F-Z)
+                        success = sheets_writer.write_product_data(
+                            product_data._sheets_row,
+                            video_data_dict,
+                            update_basic=False
+                        )
+                        
+                        if success:
+                            log.info(f"  ✅ Данные видео записаны в Google Sheets (строка {product_data._sheets_row}, столбцы F-Z)")
+                        else:
+                            log.warning(f"  ⚠️ Не удалось записать данные видео в Google Sheets")
+                    except Exception as e:
+                        log.error(f"  ❌ Ошибка при записи данных видео: {e}")
+                        import traceback
+                        log.error(traceback.format_exc())
+                else:
+                    log.warning(f"  ⚠️ Нет номера строки для записи видео данных (_sheets_row не установлен)")
+            
             log.info("=" * 80)
             log.info("✅ ОБРАБОТКА ТОВАРА ЗАВЕРШЕНА УСПЕШНО")
             log.info("=" * 80)
@@ -909,7 +1012,7 @@ class ParserEngine:
                 return True
             
             # МЕТОД 1: Прямой переход на сохраненный URL (самый надежный)
-            await self.page.goto(main_page_url, wait_until="domcontentloaded", timeout=15000)
+            await self.page.goto(main_page_url, wait_until="domcontentloaded", timeout=30000)  # Увеличен до 30 сек
             await self.human_delay(1, 2)
             
             # Ждем загрузки страницы (БЕЗ networkidle - он вызывает таймауты!)
@@ -921,7 +1024,11 @@ class ParserEngine:
             
             # Проверяем наличие карточек товаров
             try:
-                await self.page.wait_for_selector('a[href*="/tiktok-shop-product/"]', timeout=5000)
+                await self.page.wait_for_selector('a[href*="/tiktok-shop-product/"]', timeout=10000)
+                
+                # Даем странице время для полной загрузки новых карточек
+                await self.human_delay(2, 3)
+                
                 log.info("  ✅ Возврат на главную страницу успешен")
                 return True
             except:
@@ -934,19 +1041,21 @@ class ParserEngine:
             log.error(traceback.format_exc())
             return False
     
-    async def get_product_details_with_return(self, product_index: int, sheets_writer=None):
+    async def get_product_details_with_return(self, product_index: int, sheets_writer=None, banned_product_ids=None):
         """
         Обработать товар по индексу и вернуться на главную страницу
         
         Алгоритм:
         1. Сохранить URL главной страницы
         2. Кликнуть на товар по индексу
-        3. Обработать товар (get_product_details)
-        4. Вернуться на главную страницу
+        3. Проверить ban-list (если передан)
+        4. Обработать товар (get_product_details)
+        5. Вернуться на главную страницу
         
         Args:
             product_index: Индекс товара на главной странице (начиная с 0)
             sheets_writer: Объект для записи в Google Sheets
+            banned_product_ids: Множество уже обработанных product_id (для проверки дубликатов)
         
         Returns:
             ProductData если товар обработан успешно
@@ -964,6 +1073,13 @@ class ParserEngine:
         try:
             # ШАГ 1: Клик на товар по индексу
             log.info(f"\n📌 ШАГ 1: Клик на товар по индексу {product_index}...")
+            
+            def extract_product_id(url: str) -> str:
+                """Извлечь product_id из URL"""
+                url_normalized = url.rstrip('/')
+                parts = url_normalized.split('/')
+                return parts[-1] if parts else ""
+            
             try:
                 # Ищем все карточки товаров
                 product_links = await self.page.query_selector_all('a[href*="/tiktok-shop-product/"]')
@@ -993,7 +1109,23 @@ class ParserEngine:
                 else:
                     product_url = f"https://www.pipiads.com/{href}"
                 
-                log.info(f"  ✅ Получен URL товара: {product_url}")
+                # Нормализуем URL (убираем слэш в конце)
+                product_url = product_url.rstrip('/')
+                
+                # Извлекаем product_id для проверки дубликатов
+                product_id = extract_product_id(product_url)
+                
+                if not product_id:
+                    log.warning(f"  ⚠️ Не удалось извлечь product_id из URL: {product_url}, пропускаем")
+                    return None
+                
+                # КРИТИЧНО: Проверяем ban-list ПЕРЕД обработкой
+                if banned_product_ids is not None and product_id in banned_product_ids:
+                    log.warning(f"  🚫 ПРОПУСК: Товар уже в ban-list (product_id={product_id}): {product_url}")
+                    log.warning(f"     Это дубликат! Пропускаем обработку.")
+                    return {"status": "duplicate", "product_id": product_id}
+                
+                log.info(f"  ✅ Получен URL товара: {product_url} (product_id: {product_id})")
                 
             except Exception as e:
                 log.error(f"  ❌ Ошибка при получении URL товара: {e}")
@@ -1013,6 +1145,23 @@ class ParserEngine:
                 await self.return_to_main_page(main_page_url)
                 return None
             
+            # Проверяем, был ли товар пропущен из-за недостаточного количества видео после фильтрации
+            if hasattr(product_data, '_insufficient_videos') and product_data._insufficient_videos:
+                videos_found = getattr(product_data, '_videos_found', 0)
+                log.warning(f"  ⚠️ Товар пропущен: после фильтрации не осталось подходящих видео (найдено всего: {videos_found})")
+                
+                # Возвращаемся на главную
+                await self.return_to_main_page(main_page_url)
+                
+                # Возвращаем словарь со статусом "insufficient_videos"
+                return {
+                    "status": "insufficient_videos",
+                    "product_name": getattr(product_data, 'product_name', 'N/A'),
+                    "videos_found": videos_found,
+                    "videos_required": 3,
+                    "reason": f"После фильтрации (>= {config.MIN_IMPRESSIONS} impressions, <= {config.DAYS_BACK} дней) не осталось подходящих видео"
+                }
+            
             # Проверяем количество видео
             videos_count = len(product_data.videos) if hasattr(product_data, 'videos') else 0
             log.info(f"  → Найдено видео: {videos_count}")
@@ -1030,7 +1179,7 @@ class ParserEngine:
                     "product_name": getattr(product_data, 'product_name', 'N/A'),
                     "videos_found": videos_count,
                     "videos_required": 3,
-                    "reason": f"Найдено только {videos_count} видео после фильтрации"
+                    "reason": f"Найдено только {videos_count} видео после обработки"
                 }
             
             # ШАГ 4: Возврат на главную страницу
@@ -1256,25 +1405,49 @@ class ParserEngine:
                 # Ищем все блоки data-count
                 data_count_items = await card_element.query_selector_all('div.data-count div.item')
                 
-                for item in data_count_items:
+                if card_index <= 3:
+                    log.info(f"  → Карточка {card_index}: найдено {len(data_count_items)} блоков div.item")
+                
+                for idx, item in enumerate(data_count_items):
                     # Проверяем, что это блок с impression
                     caption_elem = await item.query_selector('p.caption')
                     if caption_elem:
                         caption_text = await caption_elem.inner_text()
+                        
+                        if card_index <= 3:
+                            log.info(f"  → Карточка {card_index}, блок {idx}: caption = '{caption_text}'")
+                        
                         if 'Impression' in caption_text or 'Показ' in caption_text:
                             # Нашли нужный блок, извлекаем значение
                             value_elem = await item.query_selector('p.value')
                             if value_elem:
-                                impression_str = (await value_elem.inner_text()).strip()
+                                # Попробуем несколько методов извлечения
+                                impression_str_inner = (await value_elem.inner_text()).strip()
+                                impression_str_html = (await value_elem.inner_html()).strip()
+                                impression_str_content = (await value_elem.text_content()).strip()
+                                
+                                # ВСЕГДА логируем RAW-значение (для первых 3 карточек)
+                                if card_index <= 3:
+                                    log.info(f"  → Карточка {card_index}: impression RAW (inner_text) = '{impression_str_inner}'")
+                                    log.info(f"  → Карточка {card_index}: impression RAW (inner_html) = '{impression_str_html}'")
+                                    log.info(f"  → Карточка {card_index}: impression RAW (text_content) = '{impression_str_content}'")
+                                
+                                # Используем inner_text как основной источник
+                                impression_str = impression_str_inner
                                 impression = validator.parse_impressions(impression_str)
                                 if impression:
                                     video_data["impression"] = impression
-                                    # Логируем RAW-значение для отладки
-                                    log.debug(f"  → Карточка {card_index}: impression RAW='{impression_str}' → parsed={impression}")
+                                    if card_index <= 3:
+                                        log.info(f"  → Карточка {card_index}: impression PARSED = {impression}")
                                     break
+                                else:
+                                    if card_index <= 3:
+                                        log.warning(f"  → Карточка {card_index}: parse_impressions вернул None для '{impression_str}'")
             except Exception as e:
                 if card_index <= 3:
-                    log.debug(f"  → Карточка {card_index}: ошибка при извлечении impression через селектор: {e}")
+                    log.error(f"  → Карточка {card_index}: ошибка при извлечении impression: {e}")
+                    import traceback
+                    log.error(traceback.format_exc())
             
             # ========== ИЗВЛЕЧЕНИЕ FIRST SEEN ==========
             # Ищем div.create-time > span с датой
@@ -1386,15 +1559,31 @@ class ParserEngine:
             filtered.append(video)
         
         # Сортировка: сначала по дате (самые недавние), потом по impressions (самые большие)
-        # Убираем дубликаты по tiktok_link или ad_search_url
+        # Убираем дубликаты по tiktok_link, ad_search_url или комбинации impression+first_seen
         seen_videos = set()
         unique_videos = []
         for video in filtered:
-            # Используем tiktok_link или ad_search_url для определения уникальности
-            video_id = video.get("tiktok_link") or video.get("ad_search_url") or str(video.get("impression", ""))
-            if video_id not in seen_videos:
+            # Используем несколько способов определения уникальности
+            # 1. tiktok_link (самый надежный)
+            # 2. ad_search_url (если есть)
+            # 3. Комбинация impression + first_seen (fallback)
+            video_id = None
+            
+            if video.get("tiktok_link") and video.get("tiktok_link") != "N/A":
+                video_id = f"tiktok:{video.get('tiktok_link')}"
+            elif video.get("ad_search_url") and video.get("ad_search_url") != "N/A":
+                video_id = f"ad_search:{video.get('ad_search_url')}"
+            else:
+                # Fallback: используем комбинацию impression + first_seen
+                impression = video.get("impression", 0)
+                first_seen = video.get("first_seen", "N/A")
+                video_id = f"fallback:{impression}:{first_seen}"
+            
+            if video_id and video_id not in seen_videos:
                 seen_videos.add(video_id)
                 unique_videos.append(video)
+            else:
+                log.debug(f"Видео пропущено как дубликат: {video_id}")
         
         # Сортируем: сначала по дате (самые недавние), потом по impressions (самые большие)
         def sort_key(v):
@@ -1496,6 +1685,25 @@ class ParserEngine:
             # Извлекаем данные со страницы ad-search
             # Передаем исходные данные видео (impressions из карточки) для fallback
             log.info("    → Извлечение данных со страницы ad-search...")
+            
+            # ВАЖНО: Ждем полной загрузки страницы и появления ключевых элементов перед извлечением данных
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                await self.human_delay(1, 2)  # Дополнительная задержка для загрузки контента
+                log.info("    ✅ Страница ad-search полностью загружена (networkidle)")
+            except:
+                log.warning("    ⚠️ Таймаут networkidle, продолжаем с domcontentloaded...")
+                await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                await self.human_delay(2, 3)  # Увеличена задержка
+            
+            # Ждем появления ключевых элементов (Script, Hook, Audience)
+            try:
+                # Пробуем найти хотя бы один из ключевых элементов
+                await self.page.wait_for_selector('li#ai-script, li#ai-hook, div.addel-info-item', timeout=10000, state="visible")
+                log.info("    ✅ Ключевые элементы найдены на странице ad-search")
+            except:
+                log.warning("    ⚠️ Ключевые элементы не найдены, продолжаем извлечение...")
+            
             return await self._extract_ad_search_data(video)
             
         except Exception as e:
@@ -1645,28 +1853,32 @@ class ParserEngine:
             
             # 3. Script (из "Transcript" или "Анализ транскрипта")
             log.info("      → Извлечение сценария (script)...")
+            log.info(f"      → Текущий URL страницы: {self.page.url}")
             script = await self._extract_script()
             if script:
                 video_data["script"] = script
-                log.info(f"      ✅ Script найден ({len(script)} символов)")
+                log.info(f"      ✅ Script найден ({len(script)} символов): {script[:100]}...")
             else:
                 video_data["script"] = "N/A"
-                log.info("      ⚠️ Script не найден, установлено 'N/A'")
+                log.warning("      ⚠️ Script не найден, установлено 'N/A'")
+                log.warning(f"      → Проверьте селектор li#ai-script p.content-text на странице: {self.page.url}")
             
             # 4. Hook (из секции Hook или Hooks)
             log.info("      → Извлечение hook...")
             hook = await self._extract_hook()
             if not hook:
                 # Повторный поиск, если не найден
-                log.info("      → Hook не найден, повторный поиск...")
+                log.warning("      ⚠️ Hook не найден, повторный поиск...")
+                await self.human_delay(1, 2)  # Даем время на загрузку
                 hook = await self._extract_hook()
             
             if hook:
                 video_data["hook"] = hook
-                log.info(f"      ✅ Hook найден: {hook[:50]}...")
+                log.info(f"      ✅ Hook найден ({len(hook)} символов): {hook[:100]}...")
             else:
                 video_data["hook"] = "N/A"
-                log.info("      ⚠️ Hook не найден после повторного поиска, установлено 'N/A'")
+                log.warning("      ⚠️ Hook не найден после повторного поиска, установлено 'N/A'")
+                log.warning(f"      → Проверьте селектор li#ai-hook p.content-text на странице: {self.page.url}")
             
             # 5. Audience Age (из поля Audience/Аудитория)
             log.info("      → Извлечение данных аудитории...")
@@ -1690,7 +1902,8 @@ class ParserEngine:
                 log.info(f"      ✅ Country: {country}")
             else:
                 video_data["country"] = "N/A"
-                log.info("      ⚠️ Country не найден, установлено 'N/A'")
+                log.warning("      ⚠️ Country не найден, установлено 'N/A'")
+                log.warning(f"      → Проверьте селектор div.addel-info-item с 'Country/Region' на странице: {self.page.url}")
             
             # 7. First seen (формат "Oct 27 2025" - извлекаем только первую дату из "Oct 28 2025 ~ Nov 10 2025")
             log.info("      → Извлечение даты First seen...")
@@ -1832,8 +2045,36 @@ class ParserEngine:
             return None
     
     async def _extract_script(self) -> Optional[str]:
-        """Извлечь сценарий из секции 'Script' или 'Сценарий' (или 'Transcript' или 'Анализ транскрипта')"""
+        """Извлечь сценарий из секции 'Script' или 'Сценарий' (или 'Transcript' или 'Анализ транскрипта')
+        
+        Согласно документации HTML структуры:
+        <li id="ai-script">
+            <div class="li-title">...</div>
+            <div class="control-content li-content">
+                <p class="content-text slot-wrap">...</p>
+            </div>
+        </li>
+        """
         try:
+            # МЕТОД 0: Прямой поиск по селектору из документации (самый надежный)
+            try:
+                # Сначала ждем появления элемента
+                try:
+                    await self.page.wait_for_selector('li#ai-script', timeout=5000, state="visible")
+                except:
+                    log.debug(f"      → Элемент li#ai-script не появился за 5 секунд")
+                
+                script_element = await self.page.query_selector('li#ai-script p.content-text')
+                if script_element:
+                    script = await script_element.inner_text()
+                    if script and len(script.strip()) > 10:
+                        log.info(f"      ✅ Script найден через селектор li#ai-script p.content-text ({len(script)} символов)")
+                        return script.strip()
+                else:
+                    log.debug(f"      → Элемент li#ai-script p.content-text не найден")
+            except Exception as e:
+                log.debug(f"      → Селектор li#ai-script не сработал: {e}")
+            
             # Метод 1: Поиск через локаторы (английский и русский)
             script_keywords = ["Script", "Сценарий", "Transcript", "Анализ транскрипта", "Транскрипт"]
             
@@ -2052,8 +2293,35 @@ class ParserEngine:
     async def _extract_hook(self) -> Optional[str]:
         """Извлечь hook из секции Hook/Hooks (англ.) или Хук/Хуки (рус.)
         ВАЖНО: Hook находится сразу после Script на странице!
+        
+        Согласно документации HTML структуры:
+        <li id="ai-hook">
+            <div class="li-title">...</div>
+            <div class="control-content li-content">
+                <p class="content-text slot-wrap">...</p>
+            </div>
+        </li>
         """
         try:
+            # МЕТОД 0: Прямой поиск по селектору из документации (самый надежный)
+            try:
+                # Сначала ждем появления элемента
+                try:
+                    await self.page.wait_for_selector('li#ai-hook', timeout=5000, state="visible")
+                except:
+                    log.debug(f"      → Элемент li#ai-hook не появился за 5 секунд")
+                
+                hook_element = await self.page.query_selector('li#ai-hook p.content-text')
+                if hook_element:
+                    hook = await hook_element.inner_text()
+                    if hook and len(hook.strip()) > 5:
+                        log.info(f"      ✅ Hook найден через селектор li#ai-hook p.content-text ({len(hook)} символов)")
+                        return hook.strip()
+                else:
+                    log.debug(f"      → Элемент li#ai-hook p.content-text не найден")
+            except Exception as e:
+                log.debug(f"      → Селектор li#ai-hook не сработал: {e}")
+            
             # НОВЫЙ МЕТОД: Ищем Script, затем ищем Hook в следующем элементе/секции
             try:
                 # Сначала находим Script
@@ -2559,7 +2827,35 @@ class ParserEngine:
     async def _extract_country(self) -> Optional[str]:
         """Извлечь страну из поля 'Country/Region' или 'Страна/регион' (ОТДЕЛЬНО от Audience!)"""
         try:
+            # Ждем появления элементов
+            try:
+                await self.page.wait_for_selector('div.addel-info-item', timeout=5000, state="visible")
+            except:
+                log.debug(f"      → Элементы div.addel-info-item не появились за 5 секунд")
+            
             country_keywords = ["Country/Region", "Страна/регион", "Country", "Страна", "Region", "Регион"]
+            
+            # МЕТОД 0: Структурный поиск через селекторы (самый надежный)
+            try:
+                country_items = await self.page.query_selector_all('div.addel-info-item')
+                
+                for item in country_items:
+                    # Проверяем, что это блок с Country/Region
+                    name_elem = await item.query_selector('div.name')
+                    if name_elem:
+                        name_text = await name_elem.inner_text()
+                        if 'Country/Region' in name_text or 'Страна/регион' in name_text or 'Country' in name_text or 'Страна' in name_text:
+                            # Нашли нужный блок, извлекаем страну
+                            value_elem = await item.query_selector('div.ellipsis, div.value')
+                            if value_elem:
+                                country_text = await value_elem.inner_text()
+                                # Убираем (1) и т.д.
+                                country = re.sub(r'\([0-9]+\)', '', country_text).strip()
+                                if country and len(country) > 0:
+                                    log.info(f"      ✅ Country найден через структурный селектор: {country}")
+                                    return country
+            except Exception as e:
+                log.debug(f"      → Ошибка при структурном поиске country: {e}")
             
             for keyword in country_keywords:
                 try:

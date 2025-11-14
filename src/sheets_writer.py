@@ -20,7 +20,8 @@ class SheetsWriter:
     def __init__(self):
         self.client: Optional[gspread.Client] = None
         self.spreadsheet: Optional[gspread.Spreadsheet] = None
-        self.worksheet: Optional[gspread.Worksheet] = None
+        self.worksheet: Optional[gspread.Worksheet] = None  # Основной лист (черновик)
+        self.success_worksheet: Optional[gspread.Worksheet] = None  # Лист для успешных записей
         
     def connect(self) -> bool:
         """
@@ -56,9 +57,33 @@ class SheetsWriter:
             self.spreadsheet = self.client.open_by_key(config.GOOGLE_SHEETS_ID)
             log.info(f"✅ Таблица открыта: {self.spreadsheet.title}")
             
-            # Открытие листа
-            self.worksheet = self.spreadsheet.worksheet(config.GOOGLE_SHEETS_SHEET_NAME)
-            log.info(f"✅ Лист открыт: '{config.GOOGLE_SHEETS_SHEET_NAME}'")
+            # Открытие листа "Черновик" (или создание если не существует)
+            try:
+                self.worksheet = self.spreadsheet.worksheet("Черновик")
+                log.info(f"✅ Лист 'Черновик' открыт")
+            except gspread.exceptions.WorksheetNotFound:
+                log.info("  → Лист 'Черновик' не найден, создаем...")
+                # Копируем структуру с основного листа
+                template_sheet = self.spreadsheet.worksheet(config.GOOGLE_SHEETS_SHEET_NAME)
+                self.worksheet = self.spreadsheet.duplicate_sheet(
+                    source_sheet_id=template_sheet.id,
+                    new_sheet_name="Черновик"
+                )
+                log.info("  ✅ Лист 'Черновик' создан")
+            
+            # Открытие листа "Успешные" (или создание если не существует)
+            try:
+                self.success_worksheet = self.spreadsheet.worksheet("Успешные")
+                log.info(f"✅ Лист 'Успешные' открыт")
+            except gspread.exceptions.WorksheetNotFound:
+                log.info("  → Лист 'Успешные' не найден, создаем...")
+                # Копируем структуру с основного листа
+                template_sheet = self.spreadsheet.worksheet(config.GOOGLE_SHEETS_SHEET_NAME)
+                self.success_worksheet = self.spreadsheet.duplicate_sheet(
+                    source_sheet_id=template_sheet.id,
+                    new_sheet_name="Успешные"
+                )
+                log.info("  ✅ Лист 'Успешные' создан")
             
             return True
             
@@ -334,6 +359,110 @@ class SheetsWriter:
             import traceback
             log.error(traceback.format_exc())
             return False
+    
+    def is_row_complete(self, row_number: int) -> bool:
+        """
+        Проверить, заполнена ли строка полностью (все столбцы A-Z кроме C)
+        
+        Args:
+            row_number: Номер строки в листе "Черновик"
+        
+        Returns:
+            True если все ячейки заполнены (кроме C)
+        """
+        if not self.worksheet:
+            return False
+        
+        try:
+            # Читаем строку A-Z (столбцы 1-26)
+            row_data = self.worksheet.row_values(row_number)
+            
+            if not row_data:
+                return False
+            
+            # Проверяем заполненность столбцов A-Z (индексы 0-25)
+            # Столбец C (индекс 2) пропускаем
+            for i in range(26):
+                # Пропускаем столбец C (индекс 2)
+                if i == 2:
+                    continue
+                
+                # Если столбец не заполнен или равен "N/A"
+                if i >= len(row_data) or not row_data[i] or row_data[i].strip() in ['', 'N/A']:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            log.debug(f"Ошибка при проверке заполненности строки {row_number}: {e}")
+            return False
+    
+    def copy_to_success_sheet(self, row_number: int) -> bool:
+        """
+        Скопировать успешную запись из "Черновик" на лист "Успешные"
+        
+        Вызывается только если строка полностью заполнена (проверка через is_row_complete)
+        
+        Args:
+            row_number: Номер строки в листе "Черновик"
+        
+        Returns:
+            True если успешно
+        """
+        if not self.worksheet or not self.success_worksheet:
+            log.error("❌ Листы не открыты")
+            return False
+        
+        try:
+            log.info(f"📋 Копирование строки {row_number} на лист 'Успешные'...")
+            
+            # Читаем всю строку из "Черновик"
+            row_data = self.worksheet.row_values(row_number)
+            
+            if not row_data:
+                log.error(f"❌ Строка {row_number} пуста")
+                return False
+            
+            # Находим первую пустую строку на листе "Успешные"
+            success_row = self._find_next_empty_row_in_sheet(self.success_worksheet)
+            
+            # Записываем данные на лист "Успешные"
+            # Обновляем первую ячейку (номер товара) для корректной нумерации
+            if row_data:
+                # Новый номер = success_row - SHEET_START_ROW + 1
+                row_data[0] = success_row - config.SHEET_START_ROW + 1
+            
+            self.success_worksheet.update(f'A{success_row}', [row_data])
+            
+            log.info(f"  ✅ Строка скопирована в 'Успешные' (строка {success_row})")
+            return True
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка при копировании на лист 'Успешные': {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return False
+    
+    def _find_next_empty_row_in_sheet(self, worksheet: gspread.Worksheet) -> int:
+        """Найти первую пустую строку в указанном листе"""
+        try:
+            start_row = 2
+            max_rows = 100
+            
+            # Читаем значения столбца A
+            values = worksheet.col_values(1, value_render_option='UNFORMATTED_VALUE')
+            
+            # Ищем первую пустую строку
+            for i in range(start_row - 1, max_rows):
+                if i >= len(values) or not values[i]:
+                    return i + 1
+            
+            # Если все заполнено, возвращаем следующую после последней
+            return len(values) + 1
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка при поиске пустой строки: {e}")
+            return config.SHEET_START_ROW
     
     def find_next_empty_row(self) -> int:
         """

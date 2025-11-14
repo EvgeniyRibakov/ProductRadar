@@ -88,14 +88,24 @@ async def test_parser_engine():
         log.info("=" * 80)
         
         # Настройки обработки
-        MIN_PRODUCTS_TO_COLLECT = 25  # Целевое количество успешных товаров
-        MAX_PRODUCTS_TO_CHECK = 50     # Максимум товаров для проверки (защита от бесконечного цикла)
+        # УСЛАБЛЕНО для рабочей версии: снижены требования
+        MIN_PRODUCTS_TO_COLLECT = 3   # Целевое количество успешных товаров (можно снизить до 1-2)
+        MAX_PRODUCTS_TO_CHECK = 15     # Максимум товаров для проверки за итерацию (увеличено для большего выбора)
         PRODUCTS_PER_PAGE = 20         # Количество товаров на странице
         
         successful_products = 0  # Счетчик успешно обработанных товаров
         checked_products = 0      # Счетчик проверенных товаров
         skipped_products = []     # Список пропущенных товаров
-        banned_products = set()   # Ban-list: URL товаров, которые уже проверялись и не подошли
+        banned_product_ids = set()  # Ban-list: product_id товаров, которые уже обрабатывались
+        all_products_analytics = []  # Аналитика ВСЕХ товаров для summary-файла
+        
+        def extract_product_id(url: str) -> str:
+            """Извлечь product_id из URL"""
+            # https://www.pipiads.com/tiktok-shop-product/1729732622305364547/
+            # → 1729732622305364547
+            url_normalized = url.rstrip('/')
+            parts = url_normalized.split('/')
+            return parts[-1] if parts else ""
         
         # Главный цикл обработки
         while successful_products < MIN_PRODUCTS_TO_COLLECT and checked_products < MAX_PRODUCTS_TO_CHECK:
@@ -119,6 +129,45 @@ async def test_parser_engine():
             
             log.info(f"✅ Получено {len(products)} товаров на текущей странице")
             
+            # 7.1.5. Дополнительная дедупликация по product_id (на случай если get_products_from_search_page вернул дубликаты)
+            # ВАЖНО: Используем banned_product_ids для проверки, чтобы не обрабатывать товары, которые уже были обработаны
+            unique_products = []
+            duplicate_count = 0
+            
+            for product in products:
+                product_url = product.get('url', '').rstrip('/')
+                product_id = product.get('product_id') or extract_product_id(product_url)
+                
+                if not product_id:
+                    log.warning(f"⚠️ Пропуск товара без product_id: {product_url}")
+                    continue
+                
+                # Проверяем против banned_product_ids (уже обработанные товары)
+                if product_id in banned_product_ids:
+                    duplicate_count += 1
+                    log.info(f"⏭️  Дубликат товара пропущен (уже в ban-list, product_id={product_id}): {product_url}")
+                    continue
+                
+                # Проверяем на дубликаты внутри текущего списка
+                # (если один товар встречается несколько раз в одном списке)
+                is_duplicate_in_list = any(
+                    (p.get('product_id') or extract_product_id(p.get('url', '').rstrip('/'))) == product_id
+                    for p in unique_products
+                )
+                
+                if is_duplicate_in_list:
+                    duplicate_count += 1
+                    log.info(f"⏭️  Дубликат товара пропущен (в текущем списке, product_id={product_id}): {product_url}")
+                    continue
+                
+                unique_products.append(product)
+            
+            if duplicate_count > 0:
+                log.info(f"🔍 Найдено {duplicate_count} дубликатов, оставлено {len(unique_products)} уникальных товаров")
+            
+            products = unique_products  # Используем только уникальные товары
+            log.info(f"✅ После дедупликации: {len(products)} уникальных товаров для обработки")
+            
             # 7.2. Цикл по товарам на текущей странице
             for product_index, product in enumerate(products):
                 
@@ -132,11 +181,23 @@ async def test_parser_engine():
                     log.warning(f"\n⚠️ Достигнут лимит проверок ({MAX_PRODUCTS_TO_CHECK} товаров)")
                     break
                 
-                # ⚠️ ПРОВЕРКА BAN-LIST: пропускаем товары, которые уже проверялись
-                product_url = product.get('url', '')
-                if product_url in banned_products:
-                    log.info(f"⏭️  Пропуск товара (уже проверен): {product_url}")
+                # ⚠️ ПРОВЕРКА BAN-LIST: пропускаем товары, которые уже обрабатывались
+                product_url = product.get('url', '').rstrip('/')  # Убираем слэш в конце
+                product_id = product.get('product_id') or extract_product_id(product_url)
+                
+                if not product_id:
+                    log.warning(f"⚠️ Не удалось извлечь product_id из URL: {product_url}, пропускаем")
                     continue
+                
+                # КРИТИЧНО: Проверяем ban-list ПЕРЕД обработкой
+                if product_id in banned_product_ids:
+                    log.warning(f"🚫 ПРОПУСК: Товар уже в ban-list (product_id={product_id}): {product_url}")
+                    log.warning(f"   Это дубликат! Пропускаем обработку.")
+                    continue
+                
+                # Отмечаем товар как обработанный СРАЗУ (до клика) - чтобы не обработать дважды
+                banned_product_ids.add(product_id)
+                log.info(f"   ✅ Добавлен в ban-list ПЕРЕД обработкой: product_id={product_id}, url={product_url}")
                 
                 checked_products += 1
                 
@@ -148,12 +209,15 @@ async def test_parser_engine():
                 log.info(f"Название: {product.get('name', 'N/A')[:70]}...")
                 log.info(f"Категория: {product.get('category', 'N/A')}")
                 log.info(f"URL: {product.get('url', 'N/A')}")
+                log.info(f"Product ID: {product_id}")
                 
                 try:
                     # 7.3. Обработка товара (клик по индексу, переход на страницу товара)
+                    # ВАЖНО: Передаем banned_product_ids для дополнительной проверки дубликатов
                     product_data = await parser.get_product_details_with_return(
                         product_index=product_index,
-                        sheets_writer=sheets_writer
+                        sheets_writer=sheets_writer,
+                        banned_product_ids=banned_product_ids
                     )
                     
                     # 7.4. Проверка результата
@@ -161,14 +225,26 @@ async def test_parser_engine():
                         # Ошибка при обработке
                         log.error(f"❌ Ошибка при обработке товара")
                         
-                        # Добавляем в ban-list
-                        banned_products.add(product_url)
-                        
                         skipped_products.append({
                             "name": product.get('name', 'N/A'),
                             "reason": "Ошибка при обработке",
                             "videos_found": 0
                         })
+                        
+                        # Добавляем в аналитику (без данных о видео)
+                        all_products_analytics.append({
+                            "product_name": product.get('name', 'N/A'),
+                            "product_url": product_url,
+                            "success": False,
+                            "videos_found": 0,
+                            "top_3_videos": []
+                        })
+                        continue
+                    
+                    # Проверка на дубликат (если вернулся статус "duplicate")
+                    if isinstance(product_data, dict) and product_data.get("status") == "duplicate":
+                        log.warning(f"🚫 ПРОПУСК: Товар уже обработан (дубликат, product_id={product_data.get('product_id')})")
+                        duplicate_count += 1
                         continue
                     
                     if isinstance(product_data, dict) and product_data.get("status") == "insufficient_videos":
@@ -177,19 +253,49 @@ async def test_parser_engine():
                         log.warning(f"   Найдено: {product_data.get('videos_found', 0)} видео")
                         log.warning(f"   Нужно: {product_data.get('videos_required', 3)} видео")
                         
-                        # Добавляем в ban-list
-                        banned_products.add(product_url)
-                        
                         skipped_products.append({
                             "name": product_data.get('product_name', product.get('name', 'N/A')),
                             "reason": product_data.get('reason', 'Недостаточно видео'),
                             "videos_found": product_data.get('videos_found', 0)
                         })
+                        
+                        # Добавляем в аналитику (без данных о видео - товар вернул insufficient_videos)
+                        all_products_analytics.append({
+                            "product_name": product_data.get('product_name', product.get('name', 'N/A')),
+                            "product_url": product_url,
+                            "success": False,
+                            "videos_found": product_data.get('videos_found', 0),
+                            "top_3_videos": []  # Нет данных о топ-3
+                        })
                         continue
                     
-                    # 7.5. Успешная обработка товара
+                    # 7.5. Сбор аналитики для summary
+                    analytics_entry = {
+                        "product_name": getattr(product_data, 'product_name', 'N/A'),
+                        "product_url": getattr(product_data, 'pipiads_link', product_url),
+                        "success": False,
+                        "videos_found": len(getattr(product_data, 'videos', [])),
+                        "top_3_videos": []
+                    }
+                    
+                    # Извлекаем ТОП-3 видео (по impression) из ВСЕХ видео
+                    if hasattr(product_data, '_all_videos_raw'):
+                        all_videos = product_data._all_videos_raw
+                        # Сортируем по impression (desc) и берем топ-3
+                        sorted_videos = sorted(all_videos, key=lambda v: v.get('impression', 0), reverse=True)
+                        for i, video in enumerate(sorted_videos[:3], 1):
+                            analytics_entry["top_3_videos"].append({
+                                "rank": i,
+                                "impression": video.get('impression', 0),
+                                "first_seen": video.get('first_seen', 'N/A'),
+                                "ad_search_url": video.get('ad_search_url', 'N/A')
+                            })
+                    
+                    # 7.6. Успешная обработка товара
                     if hasattr(product_data, 'videos') and len(product_data.videos) >= 3:
                         successful_products += 1
+                        analytics_entry["success"] = True
+                        
                         log.info(f"\n✅ УСПЕХ! Товар обработан ({successful_products}/{MIN_PRODUCTS_TO_COLLECT})")
                         log.info(f"   Название: {product_data.product_name[:70]}...")
                         log.info(f"   Количество видео: {len(product_data.videos)}")
@@ -198,11 +304,25 @@ async def test_parser_engine():
                         for i, video in enumerate(product_data.videos[:3], 1):
                             log.info(f"   Видео {i}: {video.get('impression', 0)} impressions, "
                                     f"{video.get('country', 'N/A')}, {video.get('audience_age', 'N/A')}")
-                    else:
-                        log.warning(f"⚠️ Товар обработан, но меньше 3 видео")
                         
-                        # Добавляем в ban-list
-                        banned_products.add(product_url)
+                        # Проверяем заполненность строки и копируем в "Успешные" если все поля заполнены
+                        if sheets_writer and hasattr(product_data, '_sheets_row'):
+                            try:
+                                # Проверяем, что все столбцы A-Z (кроме C) заполнены
+                                if sheets_writer.is_row_complete(product_data._sheets_row):
+                                    sheets_writer.copy_to_success_sheet(product_data._sheets_row)
+                                    log.info(f"  ✅ Строка {product_data._sheets_row} полностью заполнена → скопирована в 'Успешные'")
+                                else:
+                                    log.warning(f"  ⚠️ Строка {product_data._sheets_row} не полностью заполнена (есть пустые ячейки)")
+                            except Exception as e:
+                                log.warning(f"  ⚠️ Не удалось обработать копирование в 'Успешные': {e}")
+                    
+                    # Добавляем в аналитику
+                    all_products_analytics.append(analytics_entry)
+                    
+                    # 7.7. Если видео меньше 3 - пропускаем
+                    if not analytics_entry["success"]:
+                        log.warning(f"⚠️ Товар обработан, но меньше 3 видео")
                         
                         skipped_products.append({
                             "name": getattr(product_data, 'product_name', product.get('name', 'N/A')),
@@ -214,9 +334,6 @@ async def test_parser_engine():
                     log.error(f"❌ Ошибка при обработке товара: {e}")
                     import traceback
                     log.error(traceback.format_exc())
-                    
-                    # Добавляем в ban-list
-                    banned_products.add(product_url)
                     
                     skipped_products.append({
                         "name": product.get('name', 'N/A'),
@@ -238,8 +355,14 @@ async def test_parser_engine():
         log.info(f"✅ Успешно обработано товаров: {successful_products}")
         log.info(f"⏭️  Пропущено товаров: {len(skipped_products)}")
         log.info(f"🔍 Всего проверено товаров: {checked_products}")
-        log.info(f"🚫 Товаров в ban-list: {len(banned_products)}")
+        log.info(f"🚫 Товаров в ban-list: {len(banned_product_ids)}")
         log.info(f"{'='*80}")
+        
+        # Вывод ban-list
+        if banned_product_ids:
+            log.info(f"\n🚫 BAN-LIST (обработанные product_id):")
+            for i, product_id in enumerate(sorted(banned_product_ids), 1):
+                log.info(f"   {i}. {product_id}")
         
         if skipped_products:
             log.info(f"\n⏭️  СПИСОК ПРОПУЩЕННЫХ ТОВАРОВ:")
@@ -254,9 +377,9 @@ async def test_parser_engine():
             log.warning(f"\n⚠️ Достигнут лимит проверок ({MAX_PRODUCTS_TO_CHECK} товаров)")
             log.warning(f"   Собрано только {successful_products} товаров из {MIN_PRODUCTS_TO_COLLECT}")
         
-        # 9. Создание summary-файла итерации
+        # 9. Создание summary-файла итерации с подробной аналитикой
         log.info("\n" + "=" * 60)
-        log.info("📝 Создание summary-файла итерации...")
+        log.info("📝 Создание summary-файла итерации с аналитикой видео...")
         log.info("=" * 60)
         try:
             from datetime import datetime
@@ -275,18 +398,63 @@ async def test_parser_engine():
                 f.write(f"- **Успешно обработано:** {successful_products} товаров\n")
                 f.write(f"- **Пропущено:** {len(skipped_products)} товаров\n")
                 f.write(f"- **Проверено:** {checked_products} товаров\n")
-                f.write(f"- **Ban-list:** {len(banned_products)} товаров\n\n")
+                f.write(f"- **Ban-list:** {len(banned_product_ids)} товаров\n\n")
                 
                 if successful_products > 0:
                     f.write("### 🎉 SUCCESS\n\n")
                     f.write(f"✅ Обработано {successful_products} товаров с >= 3 видео\n\n")
                 
+                # ═══════════════════════════════════════════════════════
+                # НОВЫЙ БЛОК: Подробная аналитика ТОП-3 видео по товарам
+                # ═══════════════════════════════════════════════════════
+                if all_products_analytics:
+                    f.write("---\n\n")
+                    f.write("## 📹 Подробная аналитика видео по товарам\n\n")
+                    f.write(f"**Критерии фильтрации:** >= 5K impressions, возраст <= 30 дней\n\n")
+                    
+                    for idx, product in enumerate(all_products_analytics, 1):
+                        status_icon = "✅" if product["success"] else "❌"
+                        f.write(f"### {status_icon} Товар #{idx}: {product['product_name'][:80]}\n\n")
+                        f.write(f"- **Ссылка:** [{product['product_url']}]({product['product_url']})\n")
+                        f.write(f"- **Статус:** {'УСПЕХ (>= 3 видео)' if product['success'] else 'ПРОПУЩЕН (< 3 видео)'}\n")
+                        f.write(f"- **Найдено подходящих видео:** {product['videos_found']}\n\n")
+                        
+                        # ТОП-3 видео (даже если они не проходят критерии)
+                        if product['top_3_videos']:
+                            f.write("#### 🏆 ТОП-3 видео по impression:\n\n")
+                            for video in product['top_3_videos']:
+                                impression = video['impression']
+                                first_seen = video['first_seen']
+                                ad_url = video['ad_search_url']
+                                
+                                # Проверка на соответствие критериям
+                                meets_criteria = impression >= 5000  # Проверка impression
+                                criteria_icon = "✅" if meets_criteria else "⚠️"
+                                
+                                f.write(f"{video['rank']}. {criteria_icon} **{impression:,} impressions** | "
+                                       f"First seen: {first_seen}\n")
+                                if ad_url and ad_url != 'N/A':
+                                    f.write(f"   - Ссылка: [{ad_url}]({ad_url})\n")
+                                f.write("\n")
+                        else:
+                            f.write("   ⚠️ Нет данных о видео (возможно, ошибка парсинга)\n\n")
+                        
+                        f.write("---\n\n")
+                
+                # Пропущенные товары
                 if skipped_products:
-                    f.write("### ⏭️ ПРОПУЩЕННЫЕ ТОВАРЫ\n\n")
+                    f.write("### ⏭️ ПРОПУЩЕННЫЕ ТОВАРЫ (краткий список)\n\n")
                     for i, skipped in enumerate(skipped_products, 1):
                         f.write(f"{i}. **{skipped['name'][:60]}...**\n")
                         f.write(f"   - Причина: {skipped['reason']}\n")
                         f.write(f"   - Видео найдено: {skipped['videos_found']}\n\n")
+                
+                # Ban-list
+                if banned_product_ids:
+                    f.write("### 🚫 Ban-list (обработанные product_id)\n\n")
+                    for i, product_id in enumerate(sorted(banned_product_ids), 1):
+                        f.write(f"{i}. `{product_id}`\n")
+                    f.write("\n")
                 
                 f.write("## 🔍 Технические детали\n\n")
                 f.write(f"- **Целевое количество:** {MIN_PRODUCTS_TO_COLLECT} товаров\n")
@@ -300,9 +468,11 @@ async def test_parser_engine():
                 else:
                     f.write("## ❌ Статус: Прервано\n\n")
             
-            log.info(f"✅ Summary сохранен: {summary_file}")
+            log.info(f"✅ Summary с аналитикой сохранен: {summary_file}")
         except Exception as e:
             log.error(f"❌ Ошибка при создании summary: {e}")
+            import traceback
+            log.error(traceback.format_exc())
         
         log.info("\n" + "=" * 60)
         log.info("✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО УСПЕШНО")
