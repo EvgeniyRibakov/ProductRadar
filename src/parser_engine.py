@@ -45,6 +45,50 @@ class ParserEngine:
             delay = asyncio.sleep(1)  # Fallback
             await delay
     
+    def normalize_ad_search_url(self, url: str) -> str:
+        """
+        Нормализовать ad_search_url (убрать параметры запроса, слэш в конце, привести к единому формату)
+        
+        Args:
+            url: URL страницы ad-search (может быть в разных форматах)
+        
+        Returns:
+            Нормализованный URL в формате https://www.pipiads.com/ad-search/{video_id}/
+        
+        Примеры:
+            - "/ad-search/830e981c72e63bf0a587/" -> "https://www.pipiads.com/ad-search/830e981c72e63bf0a587"
+            - "https://www.pipiads.com/ad-search/830e981c72e63bf0a587/?param=value" -> "https://www.pipiads.com/ad-search/830e981c72e63bf0a587"
+            - "https://www.pipiads.com/ad-search/830e981c72e63bf0a587" -> "https://www.pipiads.com/ad-search/830e981c72e63bf0a587"
+            - "https://www.pipiads.com/ad-seearch/..." -> "https://www.pipiads.com/ad-search/..." (исправление опечатки)
+        """
+        if not url or url == "N/A":
+            return ""
+        
+        # Убираем пробелы
+        url = url.strip()
+        
+        # ИСПРАВЛЕНИЕ ОПЕЧАТКИ: ad-seearch -> ad-search
+        url = url.replace("/ad-seearch/", "/ad-search/")
+        url = url.replace("ad-seearch/", "ad-search/")
+        
+        # Убираем параметры запроса если есть
+        if '?' in url:
+            url = url.split('?')[0]
+        
+        # Убираем слэш в конце
+        url = url.rstrip('/')
+        
+        # Приводим к единому формату
+        if url.startswith("/"):
+            # Относительный путь: /ad-search/830e981c72e63bf0a587
+            url = f"https://www.pipiads.com{url}"
+        elif not url.startswith("http"):
+            # Путь без слэша в начале: ad-search/830e981c72e63bf0a587
+            url = f"https://www.pipiads.com/{url}"
+        # Если уже полный URL (https://www.pipiads.com/ad-search/...), оставляем как есть
+        
+        return url
+    
     async def scroll_to_element(self, selector: str, timeout: int = 10000):
         """
         Скроллить до элемента
@@ -338,6 +382,8 @@ class ParserEngine:
             try:
                 # Метод 1: Поиск через селекторы (приоритет)
                 name_selectors = [
+                    'h4.pro-title',  # Приоритетный селектор для Pipiads (из example_of_product_page.html)
+                    'h4[class*="pro-title"]',
                     'h1:first-of-type',
                     'h1[class*="product"]',
                     'h1[class*="title"]',
@@ -358,10 +404,28 @@ class ParserEngine:
                         for element in elements:
                             name = await element.inner_text()
                             if name and len(name) > 3:
-                                # Фильтруем служебные тексты
+                                # Фильтруем HTML-разметку и служебные тексты
                                 name_lower = name.lower()
+                                
+                                # Пропускаем если содержит HTML-теги или служебные слова
                                 skip_words = ['остаток', 'remain', 'stock', 'месяц', 'month', 'комиссия', 'commission', 
-                                            'tiktok shop product detail', 'category', 'категория']
+                                            'tiktok shop product detail', 'category', 'категория', 'view product', 
+                                            'link:', 'delivery type:', 'is affiliate', 'total sold', 'gmv', 'store',
+                                            'store sold:', 'number of products:', 'average price:', 'commission rate:']
+                                
+                                # Пропускаем если содержит HTML-теги (например, <div>, <span>, <a>)
+                                if '<' in name and '>' in name:
+                                    continue
+                                
+                                # Пропускаем если содержит множественные служебные слова (это не название товара)
+                                skip_count = sum(1 for word in skip_words if word in name_lower)
+                                if skip_count >= 2:
+                                    continue
+                                
+                                # Пропускаем слишком длинные тексты (больше 200 символов - это не название товара)
+                                if len(name) > 200:
+                                    continue
+                                
                                 if any(skip in name_lower for skip in skip_words):
                                     continue
                                 # Убираем префикс "TikTok Shop Product Detail:" если есть
@@ -377,6 +441,10 @@ class ParserEngine:
                                     continue
                                 if ":" in name and len(name.split(":")[0]) < 20:
                                     name = name.split(":", 1)[-1].strip()
+                                
+                                # Убираем лишние пробелы и переносы строк
+                                name = ' '.join(name.split())
+                                
                                 product_data.product_name = name.strip()
                                 if len(product_data.product_name) > 5:
                                     log.info(f"  ✅ Название товара найдено: {product_data.product_name[:50]}...")
@@ -874,47 +942,137 @@ class ParserEngine:
                 product_data._videos_found = len(videos)
                 return product_data
             
-            # Выбор топ-3 видео
-            video_count = 3
-            selected_videos = filtered_videos[:video_count]
-            
-            log.info(f"  ✅ Выбрано {len(selected_videos)} видео для обработки")
-            
             # ШАГ 8: Получение детальных метрик для каждого видео
-            log.info(f"\n📌 ШАГ 8: Получение детальных метрик для {len(selected_videos)} видео...")
+            log.info(f"\n📌 ШАГ 8: Получение детальных метрик для видео...")
             
             # Сохраняем URL страницы товара для возврата после каждого видео
             product_page_url = self.page.url
             log.info(f"  → Сохранен URL страницы товара: {product_page_url}")
             
-            for i, video in enumerate(selected_videos, 1):
-                log.info(f"\n  🎬 Обработка видео {i}/{len(selected_videos)}...")
+            # Бан-лист для обработанных видео (по нормализованному ad_search_url)
+            # ВАЖНО: Бан-лист очищается в начале обработки каждого товара (создается заново здесь)
+            processed_videos = set()
+            video_count = 3
+            
+            # Обрабатываем видео до тех пор, пока не обработаем 3 или не закончатся подходящие видео
+            for video_index in range(1, video_count + 1):
+                # Если уже обработали достаточно видео, выходим
+                if len(product_data.videos) >= video_count:
+                    break
+                
+                # ВАЖНО: После обработки предыдущего видео мы уже на странице товара
+                # Но для первого видео мы еще не обрабатывали, поэтому нужно убедиться, что мы на странице товара
+                if video_index == 1:
+                    # Для первого видео используем уже отфильтрованный список
+                    if len(filtered_videos) == 0:
+                        log.warning(f"  ⚠️ Нет подходящих видео для обработки")
+                        break
+                    video = filtered_videos[0]
+                else:
+                    # Для последующих видео: мы уже на странице товара после возврата
+                    # Снова собираем весь список видео с impression и first_seen
+                    log.info(f"\n  🔄 Поиск следующего видео (видео {video_index}/{video_count})...")
+                    
+                    try:
+                        # Убеждаемся, что мы на странице товара
+                        current_url = self.page.url
+                        if "/ad-search/" in current_url or current_url != product_page_url:
+                            log.info(f"    → Возврат на страницу товара для поиска следующего видео...")
+                            await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
+                            await self.human_delay(1, 2)
+                        
+                        # Прокручиваем страницу для загрузки контента
+                        page_height = await self.page.evaluate("document.body.scrollHeight")
+                        scroll_increment = 300
+                        for scroll_pos in range(0, page_height, scroll_increment):
+                            await self.page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+                            await self.human_delay(0.2, 0.3)
+                        await self.human_delay(0.5, 1)
+                        
+                        # Собираем список видео заново
+                        videos = await self._get_videos_from_tiktok_ads_block()
+                        log.info(f"    → Найдено {len(videos)} видео в блоке")
+                        
+                        # Фильтруем видео (impression >= 1000, дата <= 60 дней)
+                        filtered_videos_new = await self._filter_videos(videos)
+                        log.info(f"    → После фильтрации: {len(filtered_videos_new)} видео")
+                        
+                        # Исключаем уже обработанные видео из бан-листа
+                        available_videos = []
+                        for video in filtered_videos_new:
+                            video_ad_search_url = video.get("ad_search_url", "")
+                            if video_ad_search_url and video_ad_search_url != "N/A":
+                                video_ad_search_url = self.normalize_ad_search_url(video_ad_search_url)
+                                if video_ad_search_url not in processed_videos:
+                                    available_videos.append(video)
+                            else:
+                                # Если нет ad_search_url, тоже добавляем (на случай если это новое видео)
+                                available_videos.append(video)
+                        
+                        if len(available_videos) == 0:
+                            log.warning(f"    ⚠️ Не осталось новых видео для обработки (все уже обработаны)")
+                            break
+                        
+                        # Выбираем первое доступное видео (самое подходящее по impression и first_seen)
+                        video = available_videos[0]
+                        log.info(f"    ✅ Выбрано следующее видео: impression={video.get('impression', 0)}, first_seen={video.get('first_seen', 'N/A')}")
+                    except Exception as e:
+                        log.error(f"    ❌ Ошибка при поиске следующего видео: {e}")
+                        import traceback
+                        log.error(traceback.format_exc())
+                        break
+                
+                # Нормализуем ad_search_url для проверки дубликатов
+                video_ad_search_url = video.get("ad_search_url", "")
+                if video_ad_search_url and video_ad_search_url != "N/A":
+                    video_ad_search_url = self.normalize_ad_search_url(video_ad_search_url)
+                    
+                    # Проверяем бан-лист (дополнительная проверка)
+                    if video_ad_search_url in processed_videos:
+                        log.warning(f"  ⏭️  Видео {video_index} пропущено: уже обработано (ad_search_url={video_ad_search_url})")
+                        continue
+                
+                log.info(f"\n  🎬 Обработка видео {video_index}/{video_count}...")
                 log.info(f"    → Impression: {video.get('impression', 0)}, First seen: {video.get('first_seen', 'N/A')}")
+                if video_ad_search_url:
+                    log.info(f"    → Ad-search URL: {video_ad_search_url}")
                 
                 # Обработка видео (переход на ad-search и извлечение данных)
                 video_details = await self._get_video_details(video)
                 
                 if video_details:
                     product_data.videos.append(video_details)
-                    log.info(f"    ✅ Видео {i} обработано успешно")
+                    # Добавляем в бан-лист после успешной обработки
+                    if video_ad_search_url:
+                        processed_videos.add(video_ad_search_url)
+                        log.info(f"    ✅ Видео {video_index} обработано успешно и добавлено в бан-лист")
+                    else:
+                        log.info(f"    ✅ Видео {video_index} обработано успешно")
                 else:
-                    log.warning(f"    ⚠️ Не удалось получить детали для видео {i}")
+                    log.warning(f"    ⚠️ Не удалось получить детали для видео {video_index}")
+                    # Добавляем в бан-лист даже при ошибке, чтобы не пытаться обработать снова
+                    if video_ad_search_url:
+                        processed_videos.add(video_ad_search_url)
                 
-                # ВАЖНО: Возврат на страницу товара после обработки каждого видео
-                log.info(f"    → Возврат на страницу товара после обработки видео {i}...")
+                # ВАЖНО: Возврат на страницу товара после обработки КАЖДОГО видео
+                # Это нужно для того, чтобы после обработки всех видео скрипт был на странице товара, а не на ad-search
+                log.info(f"    → Возврат на страницу товара после обработки видео {video_index}...")
                 try:
                     await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
                     await self.human_delay(1, 2)
                     
-                    # Ждем загрузки блока TikTok Ads (чтобы можно было обработать следующее видео)
-                    try:
-                        await self.page.wait_for_selector('a[href*="/ad-search/"]', timeout=10000, state="visible")
-                        log.info(f"    ✅ Возврат на страницу товара успешен (видео {i})")
-                    except:
-                        log.warning(f"    ⚠️ Блок TikTok Ads не найден после возврата, продолжаем...")
+                    # Ждем загрузки блока TikTok Ads (чтобы можно было обработать следующее видео, если есть)
+                    if video_index < video_count:
+                        try:
+                            await self.page.wait_for_selector('a[href*="/ad-search/"]', timeout=10000, state="visible")
+                            log.info(f"    ✅ Возврат на страницу товара успешен (видео {video_index})")
+                        except:
+                            log.warning(f"    ⚠️ Блок TikTok Ads не найден после возврата, продолжаем...")
+                    else:
+                        log.info(f"    ✅ Возврат на страницу товара успешен (последнее видео {video_index})")
                 except Exception as e:
                     log.error(f"    ❌ Ошибка при возврате на страницу товара: {e}")
-                    # Продолжаем обработку следующих видео даже при ошибке возврата
+                    # Продолжаем работу даже при ошибке возврата
                 
                 await self.human_delay(0.5, 1)
             
@@ -928,9 +1086,11 @@ class ParserEngine:
                     "audience_age": "N/A",
                     "country": "N/A",
                     "first_seen": "N/A",
+                    "ad_search_url": "N/A",
                 })
             
             log.info(f"\n✅ Обработано {len(product_data.videos)} видео для товара")
+            # Примечание: мы уже на странице товара, так как возвращаемся после каждого видео (включая последнее)
             
             # ШАГ 9: Запись данных видео в Google Sheets (если sheets_writer передан)
             if sheets_writer:
@@ -1498,14 +1658,11 @@ class ParserEngine:
                 if link_element:
                     href = await link_element.get_attribute("href")
                     if href:
-                        if href.startswith("/"):
-                            video_data["ad_search_url"] = f"https://www.pipiads.com{href}"
-                        elif href.startswith("http"):
-                            video_data["ad_search_url"] = href
-                        else:
-                            video_data["ad_search_url"] = f"https://www.pipiads.com/{href}"
+                        # Применяем нормализацию сразу после извлечения
+                        video_data["ad_search_url"] = self.normalize_ad_search_url(href)
                         if card_index <= 3:
-                            log.debug(f"  → Карточка {card_index}: ad_search_url = {video_data['ad_search_url']}")
+                            log.debug(f"  → Карточка {card_index}: ad_search_url (до нормализации) = {href}")
+                            log.debug(f"  → Карточка {card_index}: ad_search_url (после нормализации) = {video_data['ad_search_url']}")
             except Exception as e:
                 if card_index <= 3:
                     log.debug(f"  → Карточка {card_index}: ошибка при извлечении ad_search_url: {e}")
@@ -1589,10 +1746,11 @@ class ParserEngine:
             # 3. Комбинация impression + first_seen (fallback)
             video_id = None
             
-            # Нормализуем ad_search_url (убираем слэш в конце)
+            # Нормализуем ad_search_url (используем полную нормализацию)
             ad_search_url = video.get("ad_search_url", "")
             if ad_search_url and ad_search_url != "N/A":
-                ad_search_url = ad_search_url.rstrip('/')
+                # Применяем полную нормализацию (исправление опечаток, параметры, формат)
+                ad_search_url = self.normalize_ad_search_url(ad_search_url)
                 video_id = f"ad_search:{ad_search_url}"
             elif video.get("tiktok_link") and video.get("tiktok_link") != "N/A":
                 video_id = f"tiktok:{video.get('tiktok_link')}"
@@ -1756,18 +1914,36 @@ class ParserEngine:
             "audience_age": "N/A",
             "country": "N/A",
             "first_seen": "N/A",
+            "ad_search_url": None,  # Будет заполнено из original_video
         }
         
-        # Сохраняем impressions из карточки для fallback
+        # Сохраняем данные из карточки для fallback и передачи в sheets_writer
         if original_video:
             original_impression = original_video.get("impression")
             if original_impression:
                 video_data["_original_impression"] = original_impression
+            
+            # Сохраняем ad_search_url из исходного видео
+            original_ad_search_url = original_video.get("ad_search_url")
+            if original_ad_search_url and original_ad_search_url != "N/A":
+                video_data["ad_search_url"] = self.normalize_ad_search_url(original_ad_search_url)
+            
+            # Сохраняем first_seen из карточки (если есть)
+            original_first_seen = original_video.get("first_seen")
+            if original_first_seen and original_first_seen != "N/A":
+                video_data["first_seen"] = original_first_seen
         
         try:
             # Ждем загрузки страницы
             await self.page.wait_for_load_state("domcontentloaded")
             await self.human_delay(0.3, 0.5)
+            
+            # Если ad_search_url не был сохранен из original_video, извлекаем из URL текущей страницы
+            if not video_data.get("ad_search_url"):
+                current_url = self.page.url
+                if "/ad-search/" in current_url:
+                    video_data["ad_search_url"] = self.normalize_ad_search_url(current_url)
+                    log.debug(f"      → Ad-search URL извлечен из текущего URL: {video_data['ad_search_url']}")
             
             # Получаем весь текст страницы для поиска
             page_text = await self.page.content()

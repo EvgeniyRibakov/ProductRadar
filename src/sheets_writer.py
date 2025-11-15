@@ -259,9 +259,14 @@ class SheetsWriter:
                     }
                     log.info(f"  → Видео {video_index + 1}: нет данных, заполняем N/A")
                 
-                # TikTok ссылка
-                tiktok_link = video.get("tiktok_link", "N/A")
-                values[config.SHEET_COLUMNS[f"{video_prefix}tiktok"]] = tiktok_link
+                # Ad-search ссылка (вместо TikTok ссылки)
+                ad_search_url = video.get("ad_search_url", "N/A")
+                if ad_search_url and ad_search_url != "N/A":
+                    values[config.SHEET_COLUMNS[f"{video_prefix}tiktok"]] = ad_search_url
+                else:
+                    # Fallback на tiktok_link если ad_search_url нет
+                    tiktok_link = video.get("tiktok_link", "N/A")
+                    values[config.SHEET_COLUMNS[f"{video_prefix}tiktok"]] = tiktok_link
                 
                 # Impression (может быть строкой "170.6K" или числом)
                 impression = video.get("impression", "N/A")
@@ -439,6 +444,142 @@ class SheetsWriter:
             
         except Exception as e:
             log.error(f"❌ Ошибка при копировании на лист 'Успешные': {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return False
+    
+    def delete_incomplete_rows(self) -> int:
+        """
+        Удалить все неполные строки из листа "Черновик"
+        
+        Неполная строка = строка где есть ПУСТЫЕ ячейки в столбцах F-Z (не N/A, а именно пустые)
+        
+        Returns:
+            Количество удаленных строк
+        """
+        if not self.worksheet:
+            log.error("❌ Лист не открыт")
+            return 0
+        
+        try:
+            log.info("🧹 Поиск и удаление неполных строк (проверка столбцов F-Z на пустые ячейки)...")
+            
+            # Получаем все значения
+            all_values = self.worksheet.get_all_values()
+            
+            # Список строк для удаления (с конца, чтобы индексы не сбились)
+            rows_to_delete = []
+            
+            # Столбцы F-Z это индексы 5-25 (F=5, G=6, ..., Z=25)
+            columns_to_check = list(range(5, 26))  # F-Z
+            
+            # Проверяем каждую строку (начиная с SHEET_START_ROW)
+            for i in range(config.SHEET_START_ROW - 1, len(all_values)):
+                row = all_values[i]
+                row_number = i + 1
+                
+                # Пропускаем пустые строки (нет данных в столбце A)
+                if not row or len(row) == 0 or not row[0] or not row[0].strip():
+                    continue
+                
+                # Проверяем столбцы F-Z на наличие ПУСТЫХ ячеек (не N/A, а именно пустых)
+                has_empty_cell = False
+                for col_index in columns_to_check:
+                    # Если столбец не существует в строке или пустой (не N/A!)
+                    if col_index >= len(row):
+                        has_empty_cell = True
+                        break
+                    cell_value = row[col_index] if col_index < len(row) else ""
+                    # Считаем пустым только если ячейка действительно пустая (не N/A)
+                    if not cell_value or (isinstance(cell_value, str) and cell_value.strip() == ""):
+                        has_empty_cell = True
+                        break
+                
+                if has_empty_cell:
+                    rows_to_delete.append(row_number)
+                    log.info(f"  → Найдена неполная строка {row_number}: {row[0][:50] if row[0] else 'N/A'}... (есть пустые ячейки в F-Z)")
+            
+            # Удаляем строки с конца (чтобы индексы не сбились)
+            deleted_count = 0
+            for row_number in reversed(rows_to_delete):
+                try:
+                    self.worksheet.delete_rows(row_number)
+                    deleted_count += 1
+                    log.info(f"  ✅ Удалена неполная строка {row_number}")
+                except Exception as e:
+                    log.warning(f"  ⚠️ Не удалось удалить строку {row_number}: {e}")
+            
+            if deleted_count > 0:
+                log.info(f"✅ Удалено {deleted_count} неполных строк")
+            else:
+                log.info("✅ Неполных строк не найдено")
+            
+            return deleted_count
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка при удалении неполных строк: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return 0
+    
+    def get_last_row_with_data(self) -> int:
+        """
+        Получить номер последней строки с данными в листе "Черновик"
+        
+        Returns:
+            Номер последней строки с данными, или 0 если нет данных
+        """
+        if not self.worksheet:
+            log.error("❌ Лист не открыт")
+            return 0
+        
+        try:
+            # Получаем все значения
+            all_values = self.worksheet.get_all_values()
+            
+            # Ищем последнюю непустую строку (проверяем столбец A)
+            last_row = 0
+            for i, row in enumerate(all_values, start=1):
+                if row and len(row) > 0 and row[0] and row[0].strip():
+                    last_row = i
+            
+            if last_row > 0:
+                log.info(f"📋 Последняя строка с данными в 'Черновик': {last_row}")
+            else:
+                log.warning("⚠️ В листе 'Черновик' нет данных")
+            
+            return last_row
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка при получении последней строки: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            return 0
+    
+    def copy_last_row_to_success(self) -> bool:
+        """
+        Скопировать последнюю строку из "Черновик" в "Успешные"
+        
+        Returns:
+            True если успешно
+        """
+        if not self.worksheet or not self.success_worksheet:
+            log.error("❌ Листы не открыты, сначала вызовите connect()")
+            return False
+        
+        try:
+            # Получаем номер последней строки с данными
+            last_row = self.get_last_row_with_data()
+            
+            if last_row == 0:
+                log.error("❌ Нет данных для копирования")
+                return False
+            
+            # Копируем строку
+            return self.copy_to_success_sheet(last_row)
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка при копировании последней строки: {e}")
             import traceback
             log.error(traceback.format_exc())
             return False

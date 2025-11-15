@@ -17,6 +17,14 @@ from src import logger
 
 log = logger.get_logger("TestParserEngine")
 
+# Проверка наличия credentials файла перед началом
+credentials_path = config.get_google_credentials_path()
+if not credentials_path.exists():
+    log.warning(f"⚠️ Файл Google credentials не найден: {credentials_path}")
+    log.warning("  → Запись в Google Sheets будет недоступна")
+else:
+    log.info(f"✅ Файл Google credentials найден: {credentials_path}")
+
 
 async def test_parser_engine():
     """Тестирование Parser Engine"""
@@ -75,12 +83,20 @@ async def test_parser_engine():
         sheets_writer = None
         try:
             sheets_writer = SheetsWriter()
+            log.info("  → Создан объект SheetsWriter")
             if sheets_writer.connect():
                 log.info("✅ Подключение к Google Sheets успешно")
+                log.info(f"  → Worksheet открыт: {sheets_writer.worksheet is not None}")
             else:
                 log.warning("⚠️ Не удалось подключиться к Google Sheets, продолжаем без записи")
+                log.warning("  → sheets_writer будет None, запись в таблицу не будет работать")
+                sheets_writer = None  # Явно устанавливаем None при неудаче
         except Exception as e:
-            log.warning(f"⚠️ Ошибка при подключении к Google Sheets: {e}, продолжаем без записи")
+            log.error(f"❌ Критическая ошибка при подключении к Google Sheets: {e}")
+            import traceback
+            log.error(traceback.format_exc())
+            log.warning("  → sheets_writer будет None, запись в таблицу не будет работать")
+            sheets_writer = None  # Явно устанавливаем None при ошибке
         
         # 7. Цикл обработки товаров с главной страницы
         log.info("\n" + "=" * 80)
@@ -479,6 +495,15 @@ async def test_parser_engine():
         log.info("\n" + "=" * 60)
         log.info("✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО УСПЕШНО")
         log.info("=" * 60)
+        
+        # Удаление неполных строк из Google Sheets
+        if sheets_writer and sheets_writer.worksheet:
+            log.info("\n🧹 Удаление неполных строк из Google Sheets...")
+            deleted_count = sheets_writer.delete_incomplete_rows()
+            if deleted_count > 0:
+                log.info(f"✅ Удалено {deleted_count} неполных строк")
+            else:
+                log.info("✅ Неполных строк не найдено")
         
         # Задержка перед закрытием (для просмотра результата)
         log.info("\n⏸️ Ожидание 10 секунд перед закрытием браузера (для просмотра результата)...")
