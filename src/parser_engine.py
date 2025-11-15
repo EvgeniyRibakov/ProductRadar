@@ -24,6 +24,9 @@ class ProductData:
         self.category: str = ""
         self.pipiads_link: str = ""
         self.videos: List[Dict[str, Any]] = []
+        # Для аналитики
+        self._all_videos_raw: List[Dict[str, Any]] = []
+        self._all_filtered_videos: List[Dict[str, Any]] = []
 
 
 class ParserEngine:
@@ -925,22 +928,31 @@ class ParserEngine:
             videos = await self._get_videos_from_tiktok_ads_block()
             log.info(f"  → Найдено {len(videos)} видео в блоке")
             
-            # ШАГ 7: Фильтрация видео
+            # ШАГ 7: Фильтрация видео и сохранение ВСЕХ подходящих в памяти
             log.info(f"\n📌 ШАГ 7: Фильтрация видео (impression >= {config.MIN_IMPRESSIONS}, дата <= {config.DAYS_BACK} дней)...")
-            filtered_videos = await self._filter_videos(videos)
-            log.info(f"  → После фильтрации: {len(filtered_videos)} видео")
             
             # Сохраняем ВСЕ видео (для аналитики) в ProductData
             product_data._all_videos_raw = videos[:20]  # Сохраняем первые 20 для аналитики
             
+            # Фильтруем ВСЕ подходящие видео (не только топ-3)
+            all_filtered_videos = await self._filter_videos_all(videos)
+            log.info(f"  → После фильтрации: {len(all_filtered_videos)} подходящих видео")
+            
+            # Сохраняем ВСЕ подходящие видео в памяти для последующего выбора топ-3
+            product_data._all_filtered_videos = all_filtered_videos
+            
             # ВАЖНО: Если после фильтрации 0 видео - пропускаем товар
-            if len(filtered_videos) == 0:
+            if len(all_filtered_videos) == 0:
                 log.warning(f"  ⚠️ После фильтрации не осталось подходящих видео (>= {config.MIN_IMPRESSIONS} impressions, <= {config.DAYS_BACK} дней)")
                 log.warning(f"  ⚠️ Товар будет пропущен")
                 # Возвращаем специальный статус для пропуска товара
                 product_data._insufficient_videos = True
                 product_data._videos_found = len(videos)
                 return product_data
+            
+            # Выбираем топ-3 из всех подходящих видео (сортировка: сначала по дате, потом по impression)
+            filtered_videos = self._select_top_videos(all_filtered_videos, top_n=3)
+            log.info(f"  → Выбрано топ-3 видео из {len(all_filtered_videos)} подходящих")
             
             # ШАГ 8: Получение детальных метрик для каждого видео
             log.info(f"\n📌 ШАГ 8: Получение детальных метрик для видео...")
@@ -954,73 +966,18 @@ class ParserEngine:
             processed_videos = set()
             video_count = 3
             
-            # Обрабатываем видео до тех пор, пока не обработаем 3 или не закончатся подходящие видео
-            for video_index in range(1, video_count + 1):
+            # Выбираем топ-3 из всех подходящих видео (уже отсортированы и дедуплицированы)
+            # Это список видео, которые мы будем обрабатывать по прямой ссылке
+            top_videos_to_process = filtered_videos[:video_count]
+            log.info(f"  → Подготовлено {len(top_videos_to_process)} видео для обработки")
+            
+            # Обрабатываем видео из списка топ-3
+            for video_index, video in enumerate(top_videos_to_process, 1):
                 # Если уже обработали достаточно видео, выходим
                 if len(product_data.videos) >= video_count:
                     break
                 
-                # ВАЖНО: После обработки предыдущего видео мы уже на странице товара
-                # Но для первого видео мы еще не обрабатывали, поэтому нужно убедиться, что мы на странице товара
-                if video_index == 1:
-                    # Для первого видео используем уже отфильтрованный список
-                    if len(filtered_videos) == 0:
-                        log.warning(f"  ⚠️ Нет подходящих видео для обработки")
-                        break
-                    video = filtered_videos[0]
-                else:
-                    # Для последующих видео: мы уже на странице товара после возврата
-                    # Снова собираем весь список видео с impression и first_seen
-                    log.info(f"\n  🔄 Поиск следующего видео (видео {video_index}/{video_count})...")
-                    
-                    try:
-                        # Убеждаемся, что мы на странице товара
-                        current_url = self.page.url
-                        if "/ad-search/" in current_url or current_url != product_page_url:
-                            log.info(f"    → Возврат на страницу товара для поиска следующего видео...")
-                            await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
-                            await self.human_delay(1, 2)
-                        
-                        # Прокручиваем страницу для загрузки контента
-                        page_height = await self.page.evaluate("document.body.scrollHeight")
-                        scroll_increment = 300
-                        for scroll_pos in range(0, page_height, scroll_increment):
-                            await self.page.evaluate(f"window.scrollTo(0, {scroll_pos})")
-                            await self.human_delay(0.2, 0.3)
-                        await self.human_delay(0.5, 1)
-                        
-                        # Собираем список видео заново
-                        videos = await self._get_videos_from_tiktok_ads_block()
-                        log.info(f"    → Найдено {len(videos)} видео в блоке")
-                        
-                        # Фильтруем видео (impression >= 1000, дата <= 60 дней)
-                        filtered_videos_new = await self._filter_videos(videos)
-                        log.info(f"    → После фильтрации: {len(filtered_videos_new)} видео")
-                        
-                        # Исключаем уже обработанные видео из бан-листа
-                        available_videos = []
-                        for video in filtered_videos_new:
-                            video_ad_search_url = video.get("ad_search_url", "")
-                            if video_ad_search_url and video_ad_search_url != "N/A":
-                                video_ad_search_url = self.normalize_ad_search_url(video_ad_search_url)
-                                if video_ad_search_url not in processed_videos:
-                                    available_videos.append(video)
-                            else:
-                                # Если нет ad_search_url, тоже добавляем (на случай если это новое видео)
-                                available_videos.append(video)
-                        
-                        if len(available_videos) == 0:
-                            log.warning(f"    ⚠️ Не осталось новых видео для обработки (все уже обработаны)")
-                            break
-                        
-                        # Выбираем первое доступное видео (самое подходящее по impression и first_seen)
-                        video = available_videos[0]
-                        log.info(f"    ✅ Выбрано следующее видео: impression={video.get('impression', 0)}, first_seen={video.get('first_seen', 'N/A')}")
-                    except Exception as e:
-                        log.error(f"    ❌ Ошибка при поиске следующего видео: {e}")
-                        import traceback
-                        log.error(traceback.format_exc())
-                        break
+                log.info(f"\n  🎬 Обработка видео {video_index}/{len(top_videos_to_process)}...")
                 
                 # Нормализуем ad_search_url для проверки дубликатов
                 video_ad_search_url = video.get("ad_search_url", "")
@@ -1032,12 +989,26 @@ class ParserEngine:
                         log.warning(f"  ⏭️  Видео {video_index} пропущено: уже обработано (ad_search_url={video_ad_search_url})")
                         continue
                 
-                log.info(f"\n  🎬 Обработка видео {video_index}/{video_count}...")
                 log.info(f"    → Impression: {video.get('impression', 0)}, First seen: {video.get('first_seen', 'N/A')}")
                 if video_ad_search_url:
                     log.info(f"    → Ad-search URL: {video_ad_search_url}")
                 
+                # ВАЖНО: Убеждаемся, что мы на странице товара перед переходом на ad-search
+                # (для первого видео мы уже на странице товара, для последующих - возвращаемся)
+                if video_index > 1:
+                    current_url = self.page.url
+                    if "/ad-search/" in current_url or current_url != product_page_url:
+                        log.info(f"    → Возврат на страницу товара перед обработкой видео {video_index}...")
+                        try:
+                            await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
+                            await self.human_delay(1, 2)
+                            log.info(f"    ✅ Возврат на страницу товара успешен")
+                        except Exception as e:
+                            log.error(f"    ❌ Ошибка при возврате на страницу товара: {e}")
+                            # Продолжаем обработку даже при ошибке возврата
+                
                 # Обработка видео (переход на ad-search и извлечение данных)
+                # Переходим по прямой ссылке ad_search_url
                 video_details = await self._get_video_details(video)
                 
                 if video_details:
@@ -1054,27 +1025,34 @@ class ParserEngine:
                     if video_ad_search_url:
                         processed_videos.add(video_ad_search_url)
                 
-                # ВАЖНО: Возврат на страницу товара после обработки КАЖДОГО видео
+                # ВАЖНО: Возврат на страницу товара после обработки КАЖДОГО видео (кроме последнего, если это последнее)
                 # Это нужно для того, чтобы после обработки всех видео скрипт был на странице товара, а не на ad-search
-                log.info(f"    → Возврат на страницу товара после обработки видео {video_index}...")
-                try:
-                    await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
-                    await self.human_delay(1, 2)
-                    
-                    # Ждем загрузки блока TikTok Ads (чтобы можно было обработать следующее видео, если есть)
-                    if video_index < video_count:
+                if video_index < len(top_videos_to_process):
+                    log.info(f"    → Возврат на страницу товара после обработки видео {video_index}...")
+                    try:
+                        await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
+                        await self.human_delay(1, 2)
+                        
+                        # Ждем загрузки блока TikTok Ads (чтобы можно было обработать следующее видео)
                         try:
                             await self.page.wait_for_selector('a[href*="/ad-search/"]', timeout=10000, state="visible")
                             log.info(f"    ✅ Возврат на страницу товара успешен (видео {video_index})")
                         except:
                             log.warning(f"    ⚠️ Блок TikTok Ads не найден после возврата, продолжаем...")
-                    else:
+                    except Exception as e:
+                        log.error(f"    ❌ Ошибка при возврате на страницу товара: {e}")
+                        # Продолжаем работу даже при ошибке возврата
+                    
+                    await self.human_delay(0.5, 1)
+                else:
+                    # После последнего видео тоже возвращаемся на страницу товара
+                    log.info(f"    → Возврат на страницу товара после обработки последнего видео {video_index}...")
+                    try:
+                        await self.page.goto(product_page_url, wait_until="domcontentloaded", timeout=30000)
+                        await self.human_delay(1, 2)
                         log.info(f"    ✅ Возврат на страницу товара успешен (последнее видео {video_index})")
-                except Exception as e:
-                    log.error(f"    ❌ Ошибка при возврате на страницу товара: {e}")
-                    # Продолжаем работу даже при ошибке возврата
-                
-                await self.human_delay(0.5, 1)
+                    except Exception as e:
+                        log.warning(f"    ⚠️ Ошибка при возврате на страницу товара: {e}")
             
             # Заполняем N/A для отсутствующих видео (нужно 3 видео)
             while len(product_data.videos) < video_count:
@@ -1495,14 +1473,12 @@ class ParserEngine:
             # Ждем появления карточек видео
             await self.human_delay(0.5, 1)
             
-            # Ищем карточки видео - пробуем разные селекторы
+            # Ищем карточки видео - используем правильный селектор из структуры HTML
             log.info("  → Поиск карточек видео через селекторы...")
             video_card_selectors = [
-                '[class*="video"]',
-                '[class*="card"]',
-                '[class*="ad"]',
-                'div[class*="item"]',
-                'a[href*="/ad-search/"]',
+                'li.item-wrap.wt-block-grid__item',  # Основной селектор (из VIDEO_CARDS_STRUCTURE.md)
+                'li.item-wrap',  # Fallback
+                'ul.lists-wrap li.item-wrap',  # С контекстом
             ]
             
             video_elements = []
@@ -1510,17 +1486,64 @@ class ParserEngine:
                 try:
                     elements = await self.page.query_selector_all(selector)
                     if elements:
-                        log.debug(f"Найдено {len(elements)} элементов с селектором {selector}")
-                        # Фильтруем только те, что содержат видео (имеют thumbnail или play button)
+                        log.debug(f"Найдено {len(elements)} элементов с селектором '{selector}'")
+                        # Проверяем, что это действительно карточки видео (имеют блок data-count)
                         for elem in elements:
-                            # Проверяем, что это карточка видео
-                            has_play_button = await elem.query_selector('[class*="play"], svg, [class*="thumbnail"]')
-                            if has_play_button or '/ad-search/' in str(await elem.get_attribute("href") or ""):
+                            # Проверяем наличие обязательных элементов карточки видео
+                            has_data_count = await elem.query_selector('div.data-count')
+                            has_ad_search_link = await elem.query_selector('a.btn-detail[href*="/ad-search/"]')
+                            if has_data_count or has_ad_search_link:
                                 video_elements.append(elem)
                         if video_elements:
+                            log.info(f"  ✅ Использован селектор: '{selector}'")
                             break
-                except:
+                except Exception as e:
+                    log.debug(f"  ⚠️ Ошибка с селектором '{selector}': {e}")
                     continue
+            
+            if not video_elements:
+                log.warning("  ⚠️ Не найдено карточек видео с основными селекторами, пробуем альтернативные...")
+                # Альтернативный поиск через ссылки ad-search
+                try:
+                    ad_search_links = await self.page.query_selector_all('a[href*="/ad-search/"]')
+                    if ad_search_links:
+                        # Находим родительские li элементы через evaluate
+                        for link in ad_search_links:
+                            parent_li_selector = await link.evaluate("""
+                                el => {
+                                    const parent = el.closest('li.item-wrap');
+                                    return parent ? 'li.item-wrap' : null;
+                                }
+                            """)
+                            if parent_li_selector:
+                                # Находим элемент через селектор относительно link
+                                parent_li = await link.evaluate_handle("el => el.closest('li.item-wrap')")
+                                if parent_li:
+                                    # Конвертируем JSHandle в ElementHandle если возможно
+                                    try:
+                                        # Проверяем что это действительно элемент
+                                        tag_name = await parent_li.evaluate("el => el.tagName")
+                                        if tag_name == "LI":
+                                            video_elements.append(parent_li)
+                                    except:
+                                        pass
+                        # Убираем дубликаты
+                        unique_elements = []
+                        seen_ids = set()
+                        for elem in video_elements:
+                            try:
+                                elem_id = await elem.evaluate("el => el.id || el.outerHTML.substring(0, 100)")
+                                if elem_id not in seen_ids:
+                                    seen_ids.add(elem_id)
+                                    unique_elements.append(elem)
+                            except:
+                                unique_elements.append(elem)
+                        video_elements = unique_elements
+                        log.info(f"  → Найдено {len(video_elements)} карточек через альтернативный поиск")
+                except Exception as e:
+                    log.warning(f"  ⚠️ Ошибка при альтернативном поиске: {e}")
+                    import traceback
+                    log.debug(traceback.format_exc())
             
             log.info(f"  → Найдено {len(video_elements)} карточек видео")
             
@@ -1683,15 +1706,131 @@ class ParserEngine:
             log.debug(traceback.format_exc())
             return None
     
-    async def _filter_videos(self, videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _filter_videos_all(self, videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Фильтрация видео по критериям
+        Фильтрация ВСЕХ подходящих видео по критериям (без ограничения топ-3)
         
         Args:
             videos: Список видео для фильтрации
         
         Returns:
-            Отфильтрованный список видео
+            Отфильтрованный список ВСЕХ подходящих видео (без дедупликации и сортировки)
+        """
+        filtered = []
+        
+        for video in videos:
+            # Проверка impression (может быть строкой "170.6K" или числом)
+            impression = video.get("impression", 0)
+            impression_num = 0
+            if isinstance(impression, str):
+                # Парсим строку в число для сравнения
+                impression_num = validator.parse_impressions(impression) or 0
+            elif isinstance(impression, (int, float)):
+                impression_num = int(impression)
+            
+            if not validator.validate_impressions(impression_num, config.MIN_IMPRESSIONS):
+                log.debug(f"Видео пропущено: impression {impression} ({impression_num}) < {config.MIN_IMPRESSIONS}")
+                continue
+            
+            # Проверка даты (если есть)
+            first_seen = video.get("first_seen")
+            if first_seen and first_seen != "N/A" and first_seen is not None:
+                parsed_date = validator.parse_video_date(first_seen)
+                if parsed_date:
+                    if not validator.is_date_within_days(parsed_date, config.DAYS_BACK):
+                        log.debug(f"Видео пропущено: дата {first_seen} старше {config.DAYS_BACK} дней")
+                        continue
+                else:
+                    # Если не удалось распарсить, но есть impression >= минимума, пропускаем проверку даты
+                    if impression_num >= config.MIN_IMPRESSIONS:
+                        log.debug(f"Видео принято: не удалось распарсить дату {first_seen}, но impression {impression_num} >= {config.MIN_IMPRESSIONS}")
+                    else:
+                        log.debug(f"Видео пропущено: не удалось распарсить дату {first_seen} и impression {impression_num} < {config.MIN_IMPRESSIONS}")
+                        continue
+            # Если даты нет, но impression >= минимума, принимаем видео
+            elif impression_num >= config.MIN_IMPRESSIONS:
+                log.debug(f"Видео принято: нет даты, но impression {impression_num} >= {config.MIN_IMPRESSIONS}")
+            else:
+                log.debug("Видео пропущено: нет даты first_seen и impression < минимума")
+                continue
+            
+            # Сохраняем числовое значение для сортировки
+            video["_impression_num"] = impression_num
+            filtered.append(video)
+        
+        log.info(f"✅ Отфильтровано {len(filtered)} подходящих видео из {len(videos)}")
+        return filtered
+    
+    def _select_top_videos(self, videos: List[Dict[str, Any]], top_n: int = 3) -> List[Dict[str, Any]]:
+        """
+        Выбрать топ-N видео из списка (с дедупликацией и сортировкой)
+        
+        Args:
+            videos: Список отфильтрованных видео
+            top_n: Количество видео для выбора (по умолчанию 3)
+        
+        Returns:
+            Топ-N видео (уникальные, отсортированные)
+        """
+        if not videos:
+            return []
+        
+        # Убираем дубликаты по ad_search_url (самый надежный), затем tiktok_link, затем комбинация
+        seen_videos = set()
+        unique_videos = []
+        for video in videos:
+            # Используем несколько способов определения уникальности (в порядке приоритета)
+            # 1. ad_search_url (самый надежный - уникальный для каждого видео)
+            # 2. tiktok_link (если ad_search_url нет)
+            # 3. Комбинация impression + first_seen (fallback)
+            video_id = None
+            
+            # Нормализуем ad_search_url (используем полную нормализацию)
+            ad_search_url = video.get("ad_search_url", "")
+            if ad_search_url and ad_search_url != "N/A":
+                # Применяем полную нормализацию (исправление опечаток, параметры, формат)
+                ad_search_url = self.normalize_ad_search_url(ad_search_url)
+                video_id = f"ad_search:{ad_search_url}"
+            elif video.get("tiktok_link") and video.get("tiktok_link") != "N/A":
+                video_id = f"tiktok:{video.get('tiktok_link')}"
+            else:
+                # Fallback: используем комбинацию impression + first_seen
+                impression = video.get("impression", 0)
+                first_seen = video.get("first_seen", "N/A")
+                video_id = f"fallback:{impression}:{first_seen}"
+            
+            if video_id and video_id not in seen_videos:
+                seen_videos.add(video_id)
+                unique_videos.append(video)
+            else:
+                log.info(f"⏭️  Видео пропущено как дубликат: {video_id}")
+        
+        # Сортируем: сначала по дате (самые недавние), потом по impressions (самые большие)
+        def sort_key(v):
+            parsed_date = validator.parse_video_date(v.get("first_seen", ""))
+            if parsed_date:
+                date_timestamp = -parsed_date.timestamp()  # Отрицательное для сортировки по убыванию (самые недавние)
+            else:
+                date_timestamp = 0  # Видео без даты в конец
+            return (date_timestamp, -v.get("_impression_num", 0))
+        
+        unique_videos.sort(key=sort_key)
+        
+        # Берем топ-N
+        top_videos = unique_videos[:top_n]
+        
+        log.info(f"✅ Выбрано топ-{top_n} из {len(unique_videos)} уникальных видео")
+        return top_videos
+    
+    async def _filter_videos(self, videos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Фильтрация видео по критериям (старая функция, оставлена для совместимости)
+        
+        Args:
+            videos: Список видео для фильтрации
+        
+        Returns:
+            Отфильтрованный список видео (топ-3)
         """
         filtered = []
         
