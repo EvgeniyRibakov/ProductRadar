@@ -33,6 +33,9 @@ session.json
 *.swp
 *.swo
 
+# Chat history (may contain secrets)
+cursor_.md
+
 # OS
 .DS_Store
 Thumbs.db
