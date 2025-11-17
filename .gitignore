@@ -19,6 +19,9 @@ ENV/
 # Logs
 logs/
 *.log
+# Исключение: пушим summaries
+!logs/summaries/
+!logs/summaries/*.md
 
 # Screenshots
 screenshots/
