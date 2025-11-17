@@ -17,9 +17,9 @@ env/
 ENV/
 
 # Logs
-logs/
 *.log
-# Исключение: пушим summaries
+# Исключение: пушим summaries (должно быть после logs/)
+logs/
 !logs/summaries/
 !logs/summaries/*.md
 
