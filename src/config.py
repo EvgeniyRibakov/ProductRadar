@@ -99,7 +99,20 @@ SHEET_COLUMNS = {
 
 
 def get_google_credentials_path() -> Path:
-    """Возвращает путь к файлу credentials Google Sheets"""
+    """
+    Возвращает путь к файлу credentials Google Sheets
+    Поддерживает оба варианта названия: google-credentials.json и google-service-account.json
+    """
+    # Сначала проверяем стандартное название
+    if GOOGLE_CREDENTIALS_PATH.exists():
+        return GOOGLE_CREDENTIALS_PATH
+    
+    # Если не найден, проверяем альтернативное название
+    alternative_path = CONFIG_DIR / "google-service-account.json"
+    if alternative_path.exists():
+        return alternative_path
+    
+    # Если ни один не найден, возвращаем стандартный путь (для сообщения об ошибке)
     return GOOGLE_CREDENTIALS_PATH
 
 
@@ -110,9 +123,10 @@ def validate_config() -> Tuple[bool, Optional[str]]:
     Returns:
         (is_valid, error_message)
     """
-    # Проверка credentials файла
-    if not GOOGLE_CREDENTIALS_PATH.exists():
-        return False, f"Google credentials файл не найден: {GOOGLE_CREDENTIALS_PATH}"
+    # Проверка credentials файла (поддерживаем оба варианта названия)
+    credentials_path = get_google_credentials_path()
+    if not credentials_path.exists():
+        return False, f"Google credentials файл не найден. Проверьте наличие одного из файлов:\n  - {GOOGLE_CREDENTIALS_PATH}\n  - {CONFIG_DIR / 'google-service-account.json'}"
     
     # Проверка обязательных параметров
     if not PIPIADS_EMAIL or not PIPIADS_PASSWORD:

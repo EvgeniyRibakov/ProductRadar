@@ -92,10 +92,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_status(query, context)
     elif data == "settings":
         await handle_settings(query, context)
-    elif data.startswith("products_"):
-        # Выбор количества товаров: products_3, products_5, etc.
-        count = int(data.split("_")[1])
-        await handle_start_parser_with_count(query, context, count)
     elif data.startswith("summary_"):
         # Просмотр конкретного саммари: summary_0, summary_1, etc.
         idx = int(data.split("_")[1])
@@ -108,7 +104,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_start_parser(query, context):
-    """Обработка запуска парсера - выбор количества товаров"""
+    """Обработка запуска парсера - прямой запуск"""
     if parser_runner_instance.is_running():
         await query.edit_message_text(
             "⚠️ Парсер уже запущен!",
@@ -118,22 +114,84 @@ async def handle_start_parser(query, context):
         )
         return
     
-    keyboard = [
-        [
-            InlineKeyboardButton("3 товара", callback_data="products_3"),
-            InlineKeyboardButton("5 товаров", callback_data="products_5"),
-        ],
-        [
-            InlineKeyboardButton("10 товаров", callback_data="products_10"),
-            InlineKeyboardButton("25 товаров", callback_data="products_25"),
-        ],
-        [InlineKeyboardButton("↩️ Назад", callback_data="back_to_menu")],
-    ]
+    # Запускаем сразу без выбора количества
+    await handle_start_parser_direct(query, context)
+
+
+async def handle_start_parser_direct(query, context):
+    """Прямой запуск парсера без выбора количества"""
+    user = query.from_user
+    log.info(f"🔄 Запуск парсера (пользователь: {user.id})")
     
-    await query.edit_message_text(
-        "🔄 Запуск парсера\n\nВыберите количество товаров:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    await query.edit_message_text(f"⏳ Запуск парсера...")
+    
+    # Небольшая задержка для обновления сообщения
+    await asyncio.sleep(0.5)
+    
+    try:
+        # Запускаем без указания количества (используются настройки по умолчанию)
+        success = parser_runner_instance.start()
+        log.info(f"   → Результат start(): {success}")
+        
+        if success:
+            # Проверяем, что процесс действительно запустился
+            await asyncio.sleep(1)  # Даем процессу время запуститься
+            
+            is_running = parser_runner_instance.is_running()
+            log.info(f"   → Процесс запущен: {is_running}")
+            
+            if is_running:
+                status = parser_runner_instance.get_status()
+                log.info(f"   → Статус процесса: PID={status.get('pid')}, running={status.get('running')}")
+                
+                await query.edit_message_text(
+                    f"✅ Парсер запущен!\n\n"
+                    f"PID: {status.get('pid')}\n"
+                    f"Ожидайте завершения...\n\n"
+                    f"Я уведомлю вас, когда парсер завершит работу.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📈 Статус", callback_data="status"),
+                        InlineKeyboardButton("🛑 Остановить", callback_data="stop_parser"),
+                    ]])
+                )
+                
+                # Запускаем отслеживание процесса
+                asyncio.create_task(monitor_parser(query.message.chat_id, context))
+            else:
+                # Процесс не запустился или сразу завершился
+                status = parser_runner_instance.get_status()
+                return_code = status.get("return_code")
+                
+                log.error(f"   ❌ Процесс не запустился! return_code={return_code}")
+                log.error(f"   → Полный статус: {status}")
+                
+                error_msg = f"❌ Парсер не запустился"
+                if return_code is not None:
+                    error_msg += f"\n\nКод ошибки: {return_code}"
+                error_msg += "\n\nПроверьте логи в терминале."
+                
+                await query.edit_message_text(
+                    error_msg,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("↩️ Назад", callback_data="back_to_menu")
+                    ]])
+                )
+        else:
+            log.error(f"   ❌ parser_runner_instance.start() вернул False")
+            await query.edit_message_text(
+                "❌ Не удалось запустить парсер. Проверьте логи.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Назад", callback_data="back_to_menu")
+                ]])
+            )
+    except Exception as e:
+        log.error(f"   ❌ Исключение при запуске парсера: {e}", exc_info=True)
+        await query.edit_message_text(
+            f"❌ Ошибка при запуске: {str(e)}\n\nПроверьте логи в терминале.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ Назад", callback_data="back_to_menu")
+            ]])
+        )
 
 
 async def handle_start_parser_with_count(query, context, count: int):

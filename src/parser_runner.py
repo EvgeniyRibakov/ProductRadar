@@ -22,7 +22,7 @@ def load_settings() -> Dict[str, Any]:
     """Загрузить настройки из JSON"""
     default_settings = {
         "min_products": 3,
-        "max_products_to_check": 15,
+        "max_products_to_check": 4,
         "products_per_page": 20,
         "min_impressions": project_config.MIN_IMPRESSIONS,
         "days_back": project_config.DAYS_BACK,
@@ -80,7 +80,7 @@ class ParserRunner:
             return False
         return self.process.poll() is None
     
-    def start(self, min_products: int = None) -> bool:
+    def start(self) -> bool:
         """Запустить парсер"""
         # Очищаем старый процесс, если он завершен
         if self.process and not self.is_running():
@@ -95,10 +95,6 @@ class ParserRunner:
         # Загружаем настройки
         self.settings = load_settings()
         
-        # Переопределяем количество товаров, если указано
-        if min_products is not None:
-            self.settings["min_products"] = min_products
-        
         # Получаем команду и переменные окружения
         cmd, env = get_parser_command(self.settings)
         
@@ -110,12 +106,12 @@ class ParserRunner:
                     f"days_back={self.settings.get('days_back')}")
             
             # Просто запускаем test_parser_engine.py
-            # Читаем в байтах, чтобы избежать проблем с кодировкой
+            # Запускаем без PIPE, чтобы логи шли в терминал в реальном времени
+            # Это поможет видеть, что происходит с парсером
             self.process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,  # Читаем в байтах
+                stdout=None,  # Вывод в терминал
+                stderr=None,  # Ошибки в терминал
                 env=env,
                 cwd=Path.cwd()
             )
@@ -123,81 +119,14 @@ class ParserRunner:
             self.start_time = datetime.now()
             log.info(f"✅ Парсер запущен: {' '.join(cmd)} (PID: {self.process.pid})")
             
-            # Проверяем, что процесс действительно запустился (синхронно, без await)
+            # Проверяем, что процесс действительно запустился
             import time
             time.sleep(0.5)  # Небольшая задержка для проверки
             if self.process.poll() is not None:
                 # Процесс уже завершился
                 return_code = self.process.returncode
                 log.error(f"❌ Процесс завершился сразу после запуска! return_code={return_code}")
-                
-                # Пытаемся прочитать вывод
-                try:
-                    import sys
-                    import io
-                    
-                    # Используем communicate() для чтения всего вывода
-                    try:
-                        # Читаем в байтах, затем декодируем с обработкой ошибок
-                        stdout_bytes, stderr_bytes = self.process.communicate(timeout=2)
-                        
-                        # Декодируем с обработкой ошибок кодировки
-                        def safe_decode(data):
-                            if data is None:
-                                return None
-                            if isinstance(data, str):
-                                return data
-                            if not data:
-                                return None
-                            # Пробуем разные кодировки для Windows
-                            for enc in ['utf-8', 'cp1251', 'cp866', 'latin1']:
-                                try:
-                                    decoded = data.decode(enc, errors='replace')
-                                    # Проверяем, что декодирование прошло нормально
-                                    if decoded:
-                                        return decoded
-                                except:
-                                    continue
-                            # Если ничего не помогло, используем utf-8 с заменой
-                            return data.decode('utf-8', errors='replace')
-                        
-                        stderr = safe_decode(stderr_bytes) if stderr_bytes else None
-                        stdout = safe_decode(stdout_bytes) if stdout_bytes else None
-                        
-                        if stderr:
-                            # Разбиваем на строки и берем последние 30 строк
-                            stderr_lines = stderr.split('\n')
-                            if len(stderr_lines) > 30:
-                                stderr_lines = stderr_lines[-30:]
-                            stderr_text = "\n".join(stderr_lines)
-                            log.error(f"   → stderr (последние 30 строк):\n{stderr_text}")
-                        else:
-                            log.warning(f"   → stderr пуст")
-                        
-                        if stdout:
-                            # Берем последние 20 строк stdout
-                            stdout_lines = stdout.split('\n')
-                            if len(stdout_lines) > 20:
-                                stdout_lines = stdout_lines[-20:]
-                            stdout_text = "\n".join(stdout_lines)
-                            log.info(f"   → stdout (последние 20 строк):\n{stdout_text[:1000]}")
-                        else:
-                            log.warning(f"   → stdout пуст")
-                            
-                    except subprocess.TimeoutExpired:
-                        log.warning(f"   → Таймаут при чтении вывода процесса")
-                        # Пытаемся убить процесс, если он еще жив
-                        try:
-                            self.process.kill()
-                            self.process.communicate(timeout=1)
-                        except:
-                            pass
-                    except Exception as e:
-                        log.error(f"   → Ошибка при communicate(): {e}", exc_info=True)
-                        
-                except Exception as e:
-                    log.error(f"   → Ошибка при чтении вывода процесса: {e}", exc_info=True)
-                
+                log.error(f"   → Проверьте логи в терминале, где запущен бот")
                 return False
             
             return True

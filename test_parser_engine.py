@@ -39,7 +39,10 @@ async def test_parser_engine():
         # 1. Инициализация браузера
         log.info("\n1. Инициализация браузера...")
         browser_manager = BrowserManager()
-        success = await browser_manager.initialize(headless=False)  # headful для отладки
+        # Используем настройку из переменной окружения (для Telegram бота)
+        headless_mode = os.environ.get("BROWSER_HEADLESS", "false").lower() == "true"
+        log.info(f"  → Режим браузера: {'headless' if headless_mode else 'headful'}")
+        success = await browser_manager.initialize(headless=headless_mode)
         if not success:
             log.error("❌ Не удалось инициализировать браузер")
             return
@@ -107,8 +110,17 @@ async def test_parser_engine():
         # Настройки обработки
         # Можно переопределить через переменные окружения (для Telegram бота)
         MIN_PRODUCTS_TO_COLLECT = int(os.getenv("MIN_PRODUCTS", "3"))
-        MAX_PRODUCTS_TO_CHECK = int(os.getenv("MAX_PRODUCTS_TO_CHECK", "15"))
+        MAX_PRODUCTS_TO_CHECK = int(os.getenv("MAX_PRODUCTS_TO_CHECK", "4"))
         PRODUCTS_PER_PAGE = int(os.getenv("PRODUCTS_PER_PAGE", "20"))
+        MIN_IMPRESSIONS = int(os.getenv("MIN_IMPRESSIONS", "1000"))
+        DAYS_BACK = int(os.getenv("DAYS_BACK", "60"))
+        
+        log.info(f"\n📋 Настройки парсера:")
+        log.info(f"   MIN_PRODUCTS_TO_COLLECT: {MIN_PRODUCTS_TO_COLLECT}")
+        log.info(f"   MAX_PRODUCTS_TO_CHECK: {MAX_PRODUCTS_TO_CHECK}")
+        log.info(f"   PRODUCTS_PER_PAGE: {PRODUCTS_PER_PAGE}")
+        log.info(f"   MIN_IMPRESSIONS: {MIN_IMPRESSIONS}")
+        log.info(f"   DAYS_BACK: {DAYS_BACK}")
         
         successful_products = 0  # Счетчик успешно обработанных товаров
         checked_products = 0      # Счетчик проверенных товаров
@@ -402,7 +414,6 @@ async def test_parser_engine():
         log.info("=" * 60)
         try:
             from datetime import datetime
-            import os
             
             summary_dir = "logs/summaries"
             os.makedirs(summary_dir, exist_ok=True)
