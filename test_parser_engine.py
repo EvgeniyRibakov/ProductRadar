@@ -4,6 +4,7 @@
 
 import asyncio
 import sys
+import os
 from pathlib import Path
 
 # Добавляем путь к src
@@ -104,10 +105,10 @@ async def test_parser_engine():
         log.info("=" * 80)
         
         # Настройки обработки
-        # УСЛАБЛЕНО для рабочей версии: снижены требования
-        MIN_PRODUCTS_TO_COLLECT = 3   # Целевое количество успешных товаров (можно снизить до 1-2)
-        MAX_PRODUCTS_TO_CHECK = 15     # Максимум товаров для проверки за итерацию (увеличено для большего выбора)
-        PRODUCTS_PER_PAGE = 20         # Количество товаров на странице
+        # Можно переопределить через переменные окружения (для Telegram бота)
+        MIN_PRODUCTS_TO_COLLECT = int(os.getenv("MIN_PRODUCTS", "3"))
+        MAX_PRODUCTS_TO_CHECK = int(os.getenv("MAX_PRODUCTS_TO_CHECK", "15"))
+        PRODUCTS_PER_PAGE = int(os.getenv("PRODUCTS_PER_PAGE", "20"))
         
         successful_products = 0  # Счетчик успешно обработанных товаров
         checked_products = 0      # Счетчик проверенных товаров
