@@ -25,37 +25,78 @@ class SheetsWriter:
         
     def connect(self) -> bool:
         """
-        Подключение к Google Sheets
+        Подключение к Google Sheets с retry логикой
         
         Returns:
             True если успешно
         """
+        import time
+        
+        # Проверка наличия credentials
+        credentials_path = config.get_google_credentials_path()
+        if not credentials_path.exists():
+            log.error(f"❌ Файл credentials не найден: {credentials_path}")
+            return False
+        
+        # Читаем email из credentials для проверки
         try:
-            log.info("Подключение к Google Sheets...")
-            
-            # Проверка наличия credentials
-            credentials_path = config.get_google_credentials_path()
-            if not credentials_path.exists():
-                log.error(f"❌ Файл credentials не найден: {credentials_path}")
-                return False
-            
-            # Авторизация
-            SCOPE = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ]
-            
-            credentials = Credentials.from_service_account_file(
-                str(credentials_path),
-                scopes=SCOPE
-            )
-            
-            self.client = gspread.authorize(credentials)
-            log.info("✅ Авторизация успешна")
-            
-            # Открытие таблицы
-            self.spreadsheet = self.client.open_by_key(config.GOOGLE_SHEETS_ID)
-            log.info(f"✅ Таблица открыта: {self.spreadsheet.title}")
+            import json
+            with open(credentials_path, 'r', encoding='utf-8') as f:
+                creds_data = json.load(f)
+                client_email = creds_data.get('client_email', 'N/A')
+                log.info(f"📧 Email из credentials: {client_email}")
+                log.info(f"   → Убедитесь, что этот email добавлен в Google таблицу с правами 'Редактор'")
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось прочитать email из credentials: {e}")
+        
+        # Retry логика для подключения
+        max_retries = 3
+        retry_delay = 5  # секунд
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                log.info(f"Подключение к Google Sheets (попытка {attempt}/{max_retries})...")
+                
+                # Авторизация
+                SCOPE = [
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"
+                ]
+                
+                credentials = Credentials.from_service_account_file(
+                    str(credentials_path),
+                    scopes=SCOPE
+                )
+                
+                self.client = gspread.authorize(credentials)
+                log.info("✅ Авторизация успешна")
+                
+                # Открытие таблицы
+                self.spreadsheet = self.client.open_by_key(config.GOOGLE_SHEETS_ID)
+                log.info(f"✅ Таблица открыта: {self.spreadsheet.title}")
+                break  # Успешно подключились
+                
+            except gspread.exceptions.APIError as e:
+                error_code = getattr(e, 'response', {}).get('status', 'unknown')
+                if error_code == 503 and attempt < max_retries:
+                    log.warning(f"⚠️ Ошибка 503 (сервис недоступен), повтор через {retry_delay}с...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log.error(f"❌ Ошибка API при подключении к Google Sheets: {e}")
+                    log.error(f"   Код ошибки: {error_code}")
+                    if error_code == 403:
+                        log.error(f"   → Проверьте, что email '{client_email}' добавлен в таблицу с правами 'Редактор'")
+                    raise
+            except Exception as e:
+                if attempt < max_retries:
+                    log.warning(f"⚠️ Ошибка при подключении (попытка {attempt}), повтор через {retry_delay}с: {e}")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    raise
+        
+        try:
             
             # Открытие листа "Черновик" (или создание если не существует)
             try:
@@ -88,9 +129,13 @@ class SheetsWriter:
             return True
             
         except Exception as e:
-            log.error(f"❌ Ошибка при подключении к Google Sheets: {e}")
+            log.error(f"❌ Ошибка при подключении к Google Sheets после {max_retries} попыток: {e}")
             import traceback
             log.error(traceback.format_exc())
+            log.error(f"\n💡 РЕШЕНИЕ:")
+            log.error(f"   1. Проверьте, что email '{client_email}' добавлен в Google таблицу")
+            log.error(f"   2. Убедитесь, что у email есть права 'Редактор'")
+            log.error(f"   3. Проверьте, что Google Sheets API включен в Google Cloud Console")
             return False
     
     def write_basic_product_data(self, product_name: str, category: str, pipiads_link: str) -> int:
