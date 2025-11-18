@@ -499,6 +499,33 @@ async def test_parser_engine():
                     f.write("## ❌ Статус: Прервано\n\n")
             
             log.info(f"✅ Summary с аналитикой сохранен: {summary_file}")
+            
+            # Автоматический push логов в GitHub после создания summary
+            try:
+                import subprocess
+                log.info("📤 Автоматический push логов в GitHub...")
+                
+                # Добавляем только папку logs/summaries
+                subprocess.run(["git", "add", "logs/summaries/"], check=False, capture_output=True)
+                
+                # Проверяем, есть ли изменения для коммита
+                result = subprocess.run(["git", "status", "--porcelain", "logs/summaries/"], 
+                                      capture_output=True, text=True, check=False)
+                
+                if result.stdout.strip():
+                    # Есть изменения - делаем коммит и push
+                    subprocess.run(["git", "commit", "-m", f"Add iteration summary: {timestamp}"], 
+                                 check=False, capture_output=True)
+                    subprocess.run(["git", "push", "origin", "testing-logs"], 
+                                 check=False, capture_output=True)
+                    log.info("✅ Логи успешно запушены в GitHub")
+                else:
+                    log.info("ℹ️  Нет новых изменений в логах для push")
+                    
+            except Exception as e:
+                log.warning(f"⚠️  Не удалось запушить логи в GitHub: {e}")
+                # Не критично, продолжаем работу
+                
         except Exception as e:
             log.error(f"❌ Ошибка при создании summary: {e}")
             import traceback
