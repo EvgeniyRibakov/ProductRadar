@@ -22,7 +22,7 @@ def load_settings() -> Dict[str, Any]:
     """Загрузить настройки из JSON"""
     default_settings = {
         "min_products": 3,
-        "max_products_to_check": 4,
+        "max_products_to_check": 40,
         "products_per_page": 20,
         "min_impressions": project_config.MIN_IMPRESSIONS,
         "days_back": project_config.DAYS_BACK,

@@ -1459,9 +1459,136 @@ class ParserEngine:
             log.error(f"  ❌ Ошибка при установке сортировки: {e}")
             return False
     
-    async def _get_videos_from_tiktok_ads_block(self) -> List[Dict[str, Any]]:
+    async def _go_to_next_page(self) -> bool:
         """
-        Получить список видео из блока TikTok Ads
+        Переключиться на следующую страницу пагинации
+        
+        Returns:
+            True если переключение успешно, False если следующей страницы нет
+        """
+        try:
+            log.info("  → Поиск блока пагинации...")
+            
+            # Ищем блок пагинации
+            pagination_selectors = [
+                'ul.el-pager',
+                '.el-pager',
+                'ul[class*="pager"]',
+            ]
+            
+            pagination_element = None
+            for selector in pagination_selectors:
+                try:
+                    pagination_element = await self.page.query_selector(selector)
+                    if pagination_element:
+                        log.info(f"  ✅ Найден блок пагинации: '{selector}'")
+                        break
+                except Exception as e:
+                    log.debug(f"  ⚠️ Ошибка с селектором '{selector}': {e}")
+                    continue
+            
+            if not pagination_element:
+                log.warning("  ⚠️ Блок пагинации не найден")
+                return False
+            
+            # Находим текущую активную страницу
+            active_page = await pagination_element.query_selector('li.number.active')
+            if not active_page:
+                log.warning("  ⚠️ Активная страница не найдена")
+                return False
+            
+            # Получаем номер текущей страницы
+            current_page_text = await active_page.inner_text()
+            try:
+                current_page_num = int(current_page_text.strip())
+            except:
+                log.warning(f"  ⚠️ Не удалось распарсить номер страницы: '{current_page_text}'")
+                return False
+            
+            log.info(f"  → Текущая страница: {current_page_num}")
+            
+            # Находим следующую страницу (следующий li.number без класса active)
+            all_page_numbers = await pagination_element.query_selector_all('li.number')
+            next_page_element = None
+            
+            for page_elem in all_page_numbers:
+                # Проверяем, что это не активная страница
+                is_active = await page_elem.evaluate("el => el.classList.contains('active')")
+                if not is_active:
+                    page_text = await page_elem.inner_text()
+                    try:
+                        page_num = int(page_text.strip())
+                        # Берем следующую страницу после текущей
+                        if page_num == current_page_num + 1:
+                            next_page_element = page_elem
+                            break
+                    except:
+                        continue
+            
+            if not next_page_element:
+                log.warning(f"  ⚠️ Следующая страница ({current_page_num + 1}) не найдена")
+                return False
+            
+            # Кликаем на следующую страницу
+            log.info(f"  → Переключение на страницу {current_page_num + 1}...")
+            await next_page_element.click()
+            
+            # Ждем загрузки новой страницы
+            await self.human_delay(1, 2)
+            
+            # Ждем появления карточек на новой странице
+            log.info("  → Ожидание загрузки новой страницы и появления карточек...")
+            
+            # Ждем, пока страница переключится (проверяем активную страницу)
+            max_wait_attempts = 10
+            for attempt in range(max_wait_attempts):
+                await self.human_delay(0.5, 1)
+                new_active_page = await pagination_element.query_selector('li.number.active')
+                if new_active_page:
+                    new_page_text = await new_active_page.inner_text()
+                    try:
+                        new_page_num = int(new_page_text.strip())
+                        if new_page_num == current_page_num + 1:
+                            log.info(f"  ✅ Страница переключена на {new_page_num}, ожидаем загрузку карточек...")
+                            break
+                    except:
+                        pass
+                if attempt == max_wait_attempts - 1:
+                    log.warning("  ⚠️ Не удалось подтвердить переключение страницы, продолжаем...")
+            
+            # Дополнительное ожидание для загрузки карточек
+            await self.human_delay(1, 2)
+            
+            # Прокручиваем страницу вниз, чтобы загрузить контент (если нужно)
+            try:
+                await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await self.human_delay(0.5, 1)
+                await self.page.evaluate("window.scrollTo(0, 0)")
+                await self.human_delay(0.5, 1)
+            except:
+                pass
+            
+            # Проверяем, что карточки видео появились на новой странице
+            video_cards_check = await self.page.query_selector_all('li.item-wrap.wt-block-grid__item')
+            if not video_cards_check:
+                video_cards_check = await self.page.query_selector_all('li.item-wrap')
+            
+            if video_cards_check:
+                log.info(f"  ✅ На новой странице найдено {len(video_cards_check)} карточек видео")
+            else:
+                log.warning("  ⚠️ На новой странице пока не найдено карточек видео, продолжаем...")
+            
+            return True
+            
+        except Exception as e:
+            log.error(f"  ❌ Ошибка при переключении страницы: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
+            return False
+    
+    async def _get_videos_from_current_page(self) -> List[Dict[str, Any]]:
+        """
+        Получить список видео с текущей страницы
         
         Returns:
             Список словарей с данными видео
@@ -1545,7 +1672,7 @@ class ParserEngine:
                     import traceback
                     log.debug(traceback.format_exc())
             
-            log.info(f"  → Найдено {len(video_elements)} карточек видео")
+            log.info(f"  → Найдено {len(video_elements)} карточек видео на текущей странице")
             
             # ОГРАНИЧЕНИЕ: Обрабатываем только первые 50 карточек для скорости
             max_cards = 50
@@ -1575,12 +1702,80 @@ class ParserEngine:
                     log.warning(f"  ⚠️ Ошибка при извлечении данных из карточки {i}: {e}")
                     continue
             
-            log.info(f"  ✅ Извлечено {len(videos)} видео из блока (успешно распарсено: {successful_extractions})")
+            log.info(f"  ✅ Извлечено {len(videos)} видео с текущей страницы (успешно распарсено: {successful_extractions})")
             return videos
             
         except Exception as e:
-            log.error(f"  ❌ Ошибка при получении видео: {e}")
+            log.error(f"  ❌ Ошибка при получении видео с текущей страницы: {e}")
             return []
+    
+    async def _get_videos_from_tiktok_ads_block(self) -> List[Dict[str, Any]]:
+        """
+        Получить список видео из блока TikTok Ads с переключением страниц
+        
+        Если на первой странице не хватает 3 подходящих видео, переключается на следующую страницу
+        и так далее, пока не наберется 3 подходящих видео или не закончатся страницы.
+        
+        Returns:
+            Список словарей с данными видео
+        """
+        all_videos = []
+        current_page = 1
+        max_pages = 10  # Защита от бесконечного цикла
+        
+        try:
+            while current_page <= max_pages:
+                log.info(f"\n  📄 Страница {current_page}:")
+                
+                # Получаем видео с текущей страницы
+                log.info(f"  → Начинаем сбор видео со страницы {current_page}...")
+                page_videos = await self._get_videos_from_current_page()
+                
+                if not page_videos:
+                    log.warning(f"  ⚠️ На странице {current_page} не найдено видео")
+                    # Если это первая страница и нет видео, возвращаем пустой список
+                    if current_page == 1:
+                        return []
+                    # Если это не первая страница, прекращаем переключение
+                    log.info(f"  → На странице {current_page} нет видео, прекращаем сбор")
+                    break
+                
+                log.info(f"  → Со страницы {current_page} собрано {len(page_videos)} видео")
+                
+                # Добавляем видео с текущей страницы к общему списку
+                all_videos.extend(page_videos)
+                log.info(f"  → Всего собрано видео со всех страниц: {len(all_videos)}")
+                
+                # Фильтруем все собранные видео
+                log.info(f"  → Фильтруем все {len(all_videos)} собранных видео...")
+                filtered_videos = await self._filter_videos_all(all_videos)
+                log.info(f"  → После фильтрации: {len(filtered_videos)} подходящих видео из {len(all_videos)} собранных")
+                
+                # Если набралось 3 или больше подходящих видео, прекращаем переключение
+                if len(filtered_videos) >= 3:
+                    log.info(f"  ✅ Набрано достаточно подходящих видео ({len(filtered_videos)} >= 3), прекращаем переключение страниц")
+                    break
+                
+                # Если не набралось 3 видео, пытаемся переключиться на следующую страницу
+                log.info(f"  → Подходящих видео пока {len(filtered_videos)} < 3, переключаемся на следующую страницу...")
+                next_page_success = await self._go_to_next_page()
+                
+                if not next_page_success:
+                    log.info(f"  → Следующей страницы нет, прекращаем переключение")
+                    break
+                
+                # Увеличиваем счетчик страницы ТОЛЬКО после успешного переключения
+                current_page += 1
+                log.info(f"  → Переключились на страницу {current_page}, продолжаем сбор...")
+            
+            log.info(f"\n  ✅ Итого собрано {len(all_videos)} видео с {current_page} страниц(ы)")
+            return all_videos
+            
+        except Exception as e:
+            log.error(f"  ❌ Ошибка при получении видео с переключением страниц: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
+            return all_videos  # Возвращаем то, что успели собрать
     
     async def _extract_video_data_from_card(self, card_element, card_index: int = 0) -> Optional[Dict[str, Any]]:
         """

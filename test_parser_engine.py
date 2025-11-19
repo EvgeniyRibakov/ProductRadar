@@ -110,7 +110,7 @@ async def test_parser_engine():
         # Настройки обработки
         # Можно переопределить через переменные окружения (для Telegram бота)
         MIN_PRODUCTS_TO_COLLECT = int(os.getenv("MIN_PRODUCTS", "3"))
-        MAX_PRODUCTS_TO_CHECK = int(os.getenv("MAX_PRODUCTS_TO_CHECK", "4"))
+        MAX_PRODUCTS_TO_CHECK = int(os.getenv("MAX_PRODUCTS_TO_CHECK", "40"))
         PRODUCTS_PER_PAGE = int(os.getenv("PRODUCTS_PER_PAGE", "20"))
         MIN_IMPRESSIONS = int(os.getenv("MIN_IMPRESSIONS", "1000"))
         DAYS_BACK = int(os.getenv("DAYS_BACK", "60"))
@@ -199,15 +199,14 @@ async def test_parser_engine():
             # 7.2. Цикл по товарам на текущей странице
             for product_index, product in enumerate(products):
                 
-                # Проверка достижения целевого количества
-                if successful_products >= MIN_PRODUCTS_TO_COLLECT:
-                    log.info(f"\n🎯 Цель достигнута! Собрано {MIN_PRODUCTS_TO_COLLECT} товаров")
-                    break
-                
-                # Проверка лимита проверенных товаров
+                # Проверка лимита проверенных товаров (приоритет над целью)
                 if checked_products >= MAX_PRODUCTS_TO_CHECK:
                     log.warning(f"\n⚠️ Достигнут лимит проверок ({MAX_PRODUCTS_TO_CHECK} товаров)")
                     break
+                
+                # Информация о достижении цели (но продолжаем работу до лимита)
+                if successful_products >= MIN_PRODUCTS_TO_COLLECT and successful_products == MIN_PRODUCTS_TO_COLLECT:
+                    log.info(f"\n🎯 Цель достигнута! Собрано {MIN_PRODUCTS_TO_COLLECT} товаров (продолжаем до лимита проверок)")
                 
                 # ⚠️ ПРОВЕРКА BAN-LIST: пропускаем товары, которые уже обрабатывались
                 product_url = normalize_url(product.get('url', ''))
@@ -253,6 +252,7 @@ async def test_parser_engine():
                         
                         skipped_products.append({
                             "name": product.get('name', 'N/A'),
+                            "url": product_url,
                             "reason": "Ошибка при обработке",
                             "videos_found": 0
                         })
@@ -261,6 +261,7 @@ async def test_parser_engine():
                         all_products_analytics.append({
                             "product_name": product.get('name', 'N/A'),
                             "product_url": product_url,
+                            "category": product.get('category', 'N/A'),
                             "success": False,
                             "videos_found": 0,
                             "top_3_videos": []
@@ -282,6 +283,7 @@ async def test_parser_engine():
                         
                         skipped_products.append({
                             "name": product_data.get('product_name', product.get('name', 'N/A')),
+                            "url": product_url,
                             "reason": product_data.get('reason', 'Недостаточно видео'),
                             "videos_found": product_data.get('videos_found', 0)
                         })
@@ -290,6 +292,7 @@ async def test_parser_engine():
                         all_products_analytics.append({
                             "product_name": product_data.get('product_name', product.get('name', 'N/A')),
                             "product_url": product_url,
+                            "category": product_data.get('category', product.get('category', 'N/A')),
                             "success": False,
                             "videos_found": product_data.get('videos_found', 0),
                             "top_3_videos": []  # Нет данных о топ-3
@@ -300,23 +303,47 @@ async def test_parser_engine():
                     analytics_entry = {
                         "product_name": getattr(product_data, 'product_name', 'N/A'),
                         "product_url": getattr(product_data, 'pipiads_link', product_url),
+                        "category": getattr(product_data, 'category', 'N/A'),
                         "success": False,
                         "videos_found": len(getattr(product_data, 'videos', [])),
                         "top_3_videos": []
                     }
                     
-                    # Извлекаем ТОП-3 видео (по impression) из ВСЕХ видео
+                    # Извлекаем ТОП-3 видео (по impression) из ВСЕХ видео с полными данными
                     if hasattr(product_data, '_all_videos_raw'):
                         all_videos = product_data._all_videos_raw
                         # Сортируем по impression (desc) и берем топ-3
-                        sorted_videos = sorted(all_videos, key=lambda v: v.get('impression', 0), reverse=True)
+                        sorted_videos = sorted(all_videos, key=lambda v: v.get('impression', 0) if isinstance(v.get('impression'), (int, float)) else 0, reverse=True)
                         for i, video in enumerate(sorted_videos[:3], 1):
                             analytics_entry["top_3_videos"].append({
                                 "rank": i,
                                 "impression": video.get('impression', 0),
                                 "first_seen": video.get('first_seen', 'N/A'),
-                                "ad_search_url": video.get('ad_search_url', 'N/A')
+                                "ad_search_url": video.get('ad_search_url', 'N/A'),
+                                "tiktok_link": video.get('tiktok_link', 'N/A'),
+                                "script": video.get('script', 'N/A'),
+                                "hook": video.get('hook', 'N/A'),
+                                "country": video.get('country', 'N/A'),
+                                "audience_age": video.get('audience_age', 'N/A')
                             })
+                    
+                    # Также добавляем данные из финальных видео (если они есть и более полные)
+                    if hasattr(product_data, 'videos') and product_data.videos:
+                        for i, final_video in enumerate(product_data.videos[:3], 1):
+                            # Обновляем данные, если они более полные
+                            if i <= len(analytics_entry["top_3_videos"]):
+                                top_video = analytics_entry["top_3_videos"][i-1]
+                                # Обновляем только если данных больше
+                                if final_video.get('tiktok_link') and final_video.get('tiktok_link') != 'N/A':
+                                    top_video['tiktok_link'] = final_video.get('tiktok_link', top_video.get('tiktok_link', 'N/A'))
+                                if final_video.get('script') and final_video.get('script') != 'N/A':
+                                    top_video['script'] = final_video.get('script', top_video.get('script', 'N/A'))
+                                if final_video.get('hook') and final_video.get('hook') != 'N/A':
+                                    top_video['hook'] = final_video.get('hook', top_video.get('hook', 'N/A'))
+                                if final_video.get('country') and final_video.get('country') != 'N/A':
+                                    top_video['country'] = final_video.get('country', top_video.get('country', 'N/A'))
+                                if final_video.get('audience_age') and final_video.get('audience_age') != 'N/A':
+                                    top_video['audience_age'] = final_video.get('audience_age', top_video.get('audience_age', 'N/A'))
                     
                     # 7.6. Успешная обработка товара
                     if hasattr(product_data, 'videos') and len(product_data.videos) >= 3:
@@ -353,6 +380,7 @@ async def test_parser_engine():
                         
                         skipped_products.append({
                             "name": getattr(product_data, 'product_name', product.get('name', 'N/A')),
+                            "url": product_url,
                             "reason": "Меньше 3 видео после обработки",
                             "videos_found": len(getattr(product_data, 'videos', []))
                         })
@@ -368,14 +396,13 @@ async def test_parser_engine():
                     
                     skipped_products.append({
                         "name": product.get('name', 'N/A'),
+                        "url": product_url,
                         "reason": f"Исключение: {str(e)[:50]}",
                         "videos_found": 0
                     })
             
             # 7.6. Проверка условий выхода из главного цикла
-            if successful_products >= MIN_PRODUCTS_TO_COLLECT:
-                break
-            
+            # Останавливаемся только при достижении лимита проверок
             if checked_products >= MAX_PRODUCTS_TO_CHECK:
                 break
         
@@ -439,45 +466,82 @@ async def test_parser_engine():
                 # ═══════════════════════════════════════════════════════
                 if all_products_analytics:
                     f.write("---\n\n")
-                    f.write("## 📹 Подробная аналитика видео по товарам\n\n")
-                    f.write(f"**Критерии фильтрации:** >= 5K impressions, возраст <= 30 дней\n\n")
+                    f.write("## 📦 Обработанные товары\n\n")
+                    f.write(f"**Критерии фильтрации:** >= {config.MIN_IMPRESSIONS} impressions, возраст <= {config.DAYS_BACK} дней\n\n")
                     
                     for idx, product in enumerate(all_products_analytics, 1):
                         status_icon = "✅" if product["success"] else "❌"
-                        f.write(f"### {status_icon} Товар #{idx}: {product['product_name'][:80]}\n\n")
-                        f.write(f"- **Ссылка:** [{product['product_url']}]({product['product_url']})\n")
-                        f.write(f"- **Статус:** {'УСПЕХ (>= 3 видео)' if product['success'] else 'ПРОПУЩЕН (< 3 видео)'}\n")
+                        product_name = product.get('product_name', 'N/A')
+                        product_url = product.get('product_url', 'N/A')
+                        category = product.get('category', 'N/A')
+                        
+                        f.write(f"### {status_icon} Товар #{idx}\n\n")
+                        f.write(f"- **Название:** {product_name}\n")
+                        f.write(f"- **Категория:** {category}\n")
+                        f.write(f"- **Ссылка:** [{product_url}]({product_url})\n")
+                        f.write(f"- **Статус:** {'✅ УСПЕХ (>= 3 видео)' if product['success'] else '❌ ПРОПУЩЕН (< 3 видео)'}\n")
                         f.write(f"- **Найдено подходящих видео:** {product['videos_found']}\n\n")
                         
-                        # ТОП-3 видео (даже если они не проходят критерии)
+                        # Решение: почему принят или пропущен
+                        if product['success']:
+                            f.write("**Решение:** Товар принят - найдено >= 3 подходящих видео после фильтрации\n\n")
+                        else:
+                            reason = "Недостаточно подходящих видео после фильтрации"
+                            if product['videos_found'] == 0:
+                                reason = "Не найдено подходящих видео (все отфильтрованы по критериям)"
+                            f.write(f"**Решение:** Товар пропущен - {reason}\n\n")
+                        
+                        # ТОП-3 видео с полными артефактами
                         if product['top_3_videos']:
                             f.write("#### 🏆 ТОП-3 видео по impression:\n\n")
                             for video in product['top_3_videos']:
-                                impression = video['impression']
-                                first_seen = video['first_seen']
-                                ad_url = video['ad_search_url']
+                                impression = video.get('impression', 0)
+                                first_seen = video.get('first_seen', 'N/A')
+                                ad_url = video.get('ad_search_url', 'N/A')
+                                tiktok_link = video.get('tiktok_link', 'N/A')
+                                script = video.get('script', 'N/A')
+                                hook = video.get('hook', 'N/A')
+                                country = video.get('country', 'N/A')
+                                audience_age = video.get('audience_age', 'N/A')
                                 
                                 # Проверка на соответствие критериям
-                                meets_criteria = impression >= 5000  # Проверка impression
+                                meets_criteria = impression >= config.MIN_IMPRESSIONS
                                 criteria_icon = "✅" if meets_criteria else "⚠️"
                                 
-                                f.write(f"{video['rank']}. {criteria_icon} **{impression:,} impressions** | "
-                                       f"First seen: {first_seen}\n")
+                                f.write(f"{video['rank']}. {criteria_icon} **{impression:,} impressions** | First seen: {first_seen}\n")
+                                
+                                # Артефакты
                                 if ad_url and ad_url != 'N/A':
-                                    f.write(f"   - Ссылка: [{ad_url}]({ad_url})\n")
+                                    f.write(f"   - **Ad-search URL:** [{ad_url}]({ad_url})\n")
+                                if tiktok_link and tiktok_link != 'N/A':
+                                    f.write(f"   - **TikTok ссылка:** [{tiktok_link}]({tiktok_link})\n")
+                                if country and country != 'N/A':
+                                    f.write(f"   - **Страна:** {country}\n")
+                                if audience_age and audience_age != 'N/A':
+                                    f.write(f"   - **Аудитория:** {audience_age}\n")
+                                if script and script != 'N/A' and len(script) > 0:
+                                    script_preview = script[:100] + "..." if len(script) > 100 else script
+                                    f.write(f"   - **Script:** {script_preview}\n")
+                                if hook and hook != 'N/A' and len(hook) > 0:
+                                    hook_preview = hook[:100] + "..." if len(hook) > 100 else hook
+                                    f.write(f"   - **Hook:** {hook_preview}\n")
                                 f.write("\n")
                         else:
                             f.write("   ⚠️ Нет данных о видео (возможно, ошибка парсинга)\n\n")
                         
                         f.write("---\n\n")
                 
-                # Пропущенные товары
+                # Пропущенные товары с подробностями
                 if skipped_products:
-                    f.write("### ⏭️ ПРОПУЩЕННЫЕ ТОВАРЫ (краткий список)\n\n")
+                    f.write("## ⏭️ Пропущенные товары\n\n")
+                    f.write("**Причины пропуска:**\n\n")
                     for i, skipped in enumerate(skipped_products, 1):
-                        f.write(f"{i}. **{skipped['name'][:60]}...**\n")
-                        f.write(f"   - Причина: {skipped['reason']}\n")
-                        f.write(f"   - Видео найдено: {skipped['videos_found']}\n\n")
+                        f.write(f"### {i}. {skipped['name']}\n\n")
+                        f.write(f"- **Причина пропуска:** {skipped['reason']}\n")
+                        f.write(f"- **Найдено видео:** {skipped['videos_found']}\n")
+                        if 'url' in skipped:
+                            f.write(f"- **Ссылка:** [{skipped['url']}]({skipped['url']})\n")
+                        f.write("\n")
                 
                 # Ban-list
                 if banned_products:
@@ -486,10 +550,24 @@ async def test_parser_engine():
                         f.write(f"{i}. `{product_url}`\n")
                     f.write("\n")
                 
-                f.write("## 🔍 Технические детали\n\n")
+                f.write("## 🔍 Технические детали итерации\n\n")
                 f.write(f"- **Целевое количество:** {MIN_PRODUCTS_TO_COLLECT} товаров\n")
                 f.write(f"- **Лимит проверок:** {MAX_PRODUCTS_TO_CHECK} товаров\n")
-                f.write(f"- **Критерии видео:** >= 5K impressions, <= 30 дней\n\n")
+                f.write(f"- **Критерии фильтрации видео:**\n")
+                f.write(f"  - Минимум impressions: >= {config.MIN_IMPRESSIONS:,}\n")
+                f.write(f"  - Максимальный возраст: <= {config.DAYS_BACK} дней\n")
+                f.write(f"- **Приоритет impressions:** >= {config.PRIORITY_IMPRESSIONS:,}\n\n")
+                
+                # Статистика по страницам (если есть информация)
+                f.write("## 📊 Статистика обработки\n\n")
+                f.write(f"- **Всего проверено товаров:** {checked_products}\n")
+                f.write(f"- **Успешно обработано:** {successful_products}\n")
+                f.write(f"- **Пропущено:** {len(skipped_products)}\n")
+                f.write(f"- **В ban-list:** {len(banned_products)}\n")
+                if successful_products > 0:
+                    success_rate = (successful_products / checked_products * 100) if checked_products > 0 else 0
+                    f.write(f"- **Процент успеха:** {success_rate:.1f}%\n")
+                f.write("\n")
                 
                 if successful_products >= MIN_PRODUCTS_TO_COLLECT:
                     f.write("## 🎯 Статус: ЦЕЛЬ ДОСТИГНУТА ✅\n\n")
