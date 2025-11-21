@@ -6,7 +6,7 @@ import asyncio
 import re
 import time
 from typing import List, Dict, Optional, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
@@ -932,7 +932,21 @@ class ParserEngine:
             log.info(f"\n📌 ШАГ 7: Фильтрация видео (impression >= {config.MIN_IMPRESSIONS}, дата <= {config.DAYS_BACK} дней)...")
             
             # Сохраняем ВСЕ видео (для аналитики) в ProductData
-            product_data._all_videos_raw = videos[:20]  # Сохраняем первые 20 для аналитики
+            # Сортируем все видео по impression (от большего к меньшему) для логирования
+            all_videos_sorted = []
+            for v in videos:
+                impression = v.get("impression", 0)
+                impression_num = 0
+                if isinstance(impression, str):
+                    impression_num = validator.parse_impressions(impression) or 0
+                elif isinstance(impression, (int, float)):
+                    impression_num = int(impression)
+                v["_impression_num"] = impression_num
+                all_videos_sorted.append(v)
+            
+            # Сортируем по impression (от большего к меньшему)
+            all_videos_sorted.sort(key=lambda x: x.get("_impression_num", 0), reverse=True)
+            product_data._all_videos_raw = all_videos_sorted  # Сохраняем ВСЕ видео, отсортированные по impression
             
             # Фильтруем ВСЕ подходящие видео (не только топ-3)
             all_filtered_videos = await self._filter_videos_all(videos)
@@ -940,6 +954,18 @@ class ParserEngine:
             
             # Сохраняем ВСЕ подходящие видео в памяти для последующего выбора топ-3
             product_data._all_filtered_videos = all_filtered_videos
+            
+            # Логируем ВСЕ собранные видео (отсортированные по impression)
+            log.info(f"\n  📋 ВСЕ СОБРАННЫЕ ВИДЕО (отсортированы по impression, от большего к меньшему):")
+            log.info(f"  → Всего собрано: {len(all_videos_sorted)} видео")
+            for idx, v in enumerate(all_videos_sorted[:20], 1):  # Показываем первые 20
+                name = v.get("video_name", "N/A")
+                imp = v.get("impression", "N/A")
+                imp_num = v.get("_impression_num", 0)
+                date = v.get("first_seen", "N/A")
+                log.info(f"     {idx}. Название: {name[:80]}... | impression: {imp} ({imp_num}) | first_seen: {date}")
+            if len(all_videos_sorted) > 20:
+                log.info(f"     ... и еще {len(all_videos_sorted) - 20} видео")
             
             # ВАЖНО: Если после фильтрации 0 видео - пропускаем товар
             if len(all_filtered_videos) == 0:
@@ -950,9 +976,9 @@ class ParserEngine:
                 product_data._videos_found = len(videos)
                 return product_data
             
-            # Выбираем топ-3 из всех подходящих видео (сортировка: сначала по дате, потом по impression)
+            # Выбираем топ-3 из всех подходящих видео (сортировка: сначала по impression, потом по дате)
             filtered_videos = self._select_top_videos(all_filtered_videos, top_n=3)
-            log.info(f"  → Выбрано топ-3 видео из {len(all_filtered_videos)} подходящих")
+            log.info(f"  → Выбрано топ-3 видео по просмотрам (impression) из {len(all_filtered_videos)} подходящих")
             
             # ШАГ 8: Получение детальных метрик для каждого видео
             log.info(f"\n📌 ШАГ 8: Получение детальных метрик для видео...")
@@ -1713,15 +1739,16 @@ class ParserEngine:
         """
         Получить список видео из блока TikTok Ads с переключением страниц
         
-        Если на первой странице не хватает 3 подходящих видео, переключается на следующую страницу
-        и так далее, пока не наберется 3 подходящих видео или не закончатся страницы.
+        Собирает видео со всех доступных страниц для последующего выбора топ-3 по просмотрам (impression).
+        Переключается на следующую страницу, если на текущих страницах не набралось достаточно подходящих видео.
         
         Returns:
-            Список словарей с данными видео
+            Список словарей с данными видео (все собранные, без фильтрации)
         """
         all_videos = []
         current_page = 1
         max_pages = 10  # Защита от бесконечного цикла
+        min_filtered_videos = 3  # Минимум подходящих видео для остановки
         
         try:
             while current_page <= max_pages:
@@ -1735,9 +1762,10 @@ class ParserEngine:
                     log.warning(f"  ⚠️ На странице {current_page} не найдено видео")
                     # Если это первая страница и нет видео, возвращаем пустой список
                     if current_page == 1:
+                        log.warning("  ⚠️ На первой странице нет видео, прекращаем сбор")
                         return []
-                    # Если это не первая страница, прекращаем переключение
-                    log.info(f"  → На странице {current_page} нет видео, прекращаем сбор")
+                    # Если это не первая страница, проверяем что уже собрали
+                    log.info(f"  → На странице {current_page} нет видео, проверяем собранные данные...")
                     break
                 
                 log.info(f"  → Со страницы {current_page} собрано {len(page_videos)} видео")
@@ -1746,18 +1774,24 @@ class ParserEngine:
                 all_videos.extend(page_videos)
                 log.info(f"  → Всего собрано видео со всех страниц: {len(all_videos)}")
                 
-                # Фильтруем все собранные видео
-                log.info(f"  → Фильтруем все {len(all_videos)} собранных видео...")
+                # Фильтруем все собранные видео для проверки количества подходящих
+                log.info(f"  → Фильтруем все {len(all_videos)} собранных видео для проверки...")
                 filtered_videos = await self._filter_videos_all(all_videos)
                 log.info(f"  → После фильтрации: {len(filtered_videos)} подходящих видео из {len(all_videos)} собранных")
                 
-                # Если набралось 3 или больше подходящих видео, прекращаем переключение
-                if len(filtered_videos) >= 3:
-                    log.info(f"  ✅ Набрано достаточно подходящих видео ({len(filtered_videos)} >= 3), прекращаем переключение страниц")
-                    break
+                # Если набралось достаточно подходящих видео, можно прекратить переключение
+                # Но продолжаем собирать еще 1-2 страницы для лучшего выбора топ-3
+                if len(filtered_videos) >= min_filtered_videos:
+                    if current_page >= 3:  # Собрали минимум 3 страницы
+                        log.info(f"  ✅ Набрано достаточно подходящих видео ({len(filtered_videos)} >= {min_filtered_videos}) после {current_page} страниц, прекращаем переключение")
+                        break
+                    else:
+                        log.info(f"  → Набрано {len(filtered_videos)} подходящих видео, но собрано только {current_page} страниц(ы), продолжаем для лучшего выбора топ-3...")
                 
-                # Если не набралось 3 видео, пытаемся переключиться на следующую страницу
-                log.info(f"  → Подходящих видео пока {len(filtered_videos)} < 3, переключаемся на следующую страницу...")
+                # Если не набралось достаточно видео, пытаемся переключиться на следующую страницу
+                if len(filtered_videos) < min_filtered_videos:
+                    log.info(f"  → Подходящих видео пока {len(filtered_videos)} < {min_filtered_videos}, переключаемся на следующую страницу...")
+                
                 next_page_success = await self._go_to_next_page()
                 
                 if not next_page_success:
@@ -1790,11 +1824,42 @@ class ParserEngine:
         """
         try:
             video_data = {
+                "video_name": "N/A",  # Название видео
                 "ad_search_url": None,
                 "impression": 0,
                 "first_seen": None,
                 "card_element": card_element,  # Сохраняем для клика
             }
+            
+            # ========== ИЗВЛЕЧЕНИЕ НАЗВАНИЯ ВИДЕО ==========
+            # Пробуем найти название видео в карточке
+            try:
+                # Вариант 1: ищем в заголовке карточки
+                title_elem = await card_element.query_selector('h3, h4, .title, [class*="title"], [class*="name"]')
+                if title_elem:
+                    title_text = (await title_elem.inner_text()).strip()
+                    if title_text and len(title_text) > 0:
+                        video_data["video_name"] = title_text[:200]  # Ограничиваем длину
+                
+                # Вариант 2: если не нашли, ищем в тексте карточки
+                if video_data["video_name"] == "N/A":
+                    text_elem = await card_element.query_selector('p, span, div[class*="text"], div[class*="content"]')
+                    if text_elem:
+                        text_content = (await text_elem.inner_text()).strip()
+                        if text_content and len(text_content) > 10:  # Минимум 10 символов
+                            video_data["video_name"] = text_content[:200]
+                
+                # Вариант 3: если все еще не нашли, берем первый непустой текстовый узел
+                if video_data["video_name"] == "N/A":
+                    all_text = await card_element.inner_text()
+                    if all_text:
+                        # Берем первые 200 символов, убираем лишние пробелы
+                        clean_text = ' '.join(all_text.split())[:200]
+                        if clean_text:
+                            video_data["video_name"] = clean_text
+            except Exception as e:
+                if card_index <= 3:
+                    log.debug(f"  → Карточка {card_index}: ошибка при извлечении названия видео: {e}")
             
             # ========== ИЗВЛЕЧЕНИЕ IMPRESSION ==========
             # Используем структурные селекторы на основе HTML-структуры
@@ -1830,17 +1895,26 @@ class ParserEngine:
                                     log.info(f"  → Карточка {card_index}: impression RAW (inner_html) = '{impression_str_html}'")
                                     log.info(f"  → Карточка {card_index}: impression RAW (text_content) = '{impression_str_content}'")
                                 
-                                # Используем inner_text как основной источник
-                                impression_str = impression_str_inner
-                                impression = validator.parse_impressions(impression_str)
-                                if impression:
-                                    video_data["impression"] = impression
+                                # Пробуем все три варианта извлечения
+                                for impression_str in [impression_str_inner, impression_str_html, impression_str_content]:
+                                    if not impression_str:
+                                        continue
+                                    impression = validator.parse_impressions(impression_str)
+                                    if impression:
+                                        video_data["impression"] = impression
+                                        if card_index <= 3:
+                                            log.info(f"  → Карточка {card_index}: impression PARSED = {impression} (из '{impression_str}')")
+                                        break
+                                
+                                # Если не удалось распарсить ни одним способом
+                                if not video_data["impression"]:
                                     if card_index <= 3:
-                                        log.info(f"  → Карточка {card_index}: impression PARSED = {impression}")
-                                    break
+                                        log.warning(f"  → Карточка {card_index}: не удалось распарсить impression из всех вариантов:")
+                                        log.warning(f"     - inner_text: '{impression_str_inner}'")
+                                        log.warning(f"     - inner_html: '{impression_str_html}'")
+                                        log.warning(f"     - text_content: '{impression_str_content}'")
                                 else:
-                                    if card_index <= 3:
-                                        log.warning(f"  → Карточка {card_index}: parse_impressions вернул None для '{impression_str}'")
+                                    break  # Успешно распарсили, выходим из цикла
             except Exception as e:
                 if card_index <= 3:
                     log.error(f"  → Карточка {card_index}: ошибка при извлечении impression: {e}")
@@ -1853,19 +1927,44 @@ class ParserEngine:
                 create_time_elem = await card_element.query_selector('div.create-time span')
                 if create_time_elem:
                     date_text = (await create_time_elem.inner_text()).strip()
-                    # Логируем RAW-значение
-                    log.debug(f"  → Карточка {card_index}: first_seen RAW='{date_text}'")
+                    # Логируем RAW-значение для первых карточек
+                    if card_index <= 3:
+                        log.debug(f"  → Карточка {card_index}: first_seen RAW='{date_text}'")
                     
-                    # Формат: "Nov 05 2025-Nov 11 2025" - берем ПЕРВУЮ дату (до дефиса)
-                    # Используем regex для извлечения первой даты
+                    # Пробуем разные форматы:
+                    # 1. "Nov 05 2025-Nov 11 2025" - диапазон, берем ПЕРВУЮ дату (до дефиса)
+                    # 2. "Nov 05 2025" - одиночная дата
+                    # 3. "Nov 05 2025 ~ Nov 11 2025" - диапазон через тильду
+                    
+                    first_seen_str = None
+                    parsed_date = None
+                    
+                    # Формат 1: диапазон через дефис "Nov 05 2025-Nov 11 2025"
                     match = re.match(r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})', date_text)
                     if match:
                         first_seen_str = match.group(1)
-                        # Проверяем валидность даты
                         parsed_date = validator.parse_video_date(first_seen_str)
+                    
+                    # Формат 2: диапазон через тильду "Nov 05 2025 ~ Nov 11 2025"
+                    if not parsed_date:
+                        match = re.match(r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{4})\s*~', date_text)
+                        if match:
+                            first_seen_str = match.group(1)
+                            parsed_date = validator.parse_video_date(first_seen_str)
+                    
+                    # Формат 3: одиночная дата "Nov 05 2025"
+                    if not parsed_date:
+                        parsed_date = validator.parse_video_date(date_text)
                         if parsed_date:
-                            video_data["first_seen"] = first_seen_str
+                            first_seen_str = date_text
+                    
+                    if parsed_date:
+                        video_data["first_seen"] = first_seen_str
+                        if card_index <= 3:
                             log.debug(f"  → Карточка {card_index}: first_seen parsed='{first_seen_str}'")
+                    else:
+                        if card_index <= 3:
+                            log.warning(f"  → Карточка {card_index}: не удалось распарсить дату '{date_text}'")
             except Exception as e:
                 if card_index <= 3:
                     log.debug(f"  → Карточка {card_index}: ошибка при извлечении first_seen через селектор: {e}")
@@ -1905,6 +2004,10 @@ class ParserEngine:
         """
         Фильтрация ВСЕХ подходящих видео по критериям (без ограничения топ-3)
         
+        Критерии:
+        - impression >= MIN_IMPRESSIONS (1000)
+        - first_seen СТРОГО не старше DAYS_BACK (7 дней) от сегодня
+        
         Args:
             videos: Список видео для фильтрации
         
@@ -1912,48 +2015,124 @@ class ParserEngine:
             Отфильтрованный список ВСЕХ подходящих видео (без дедупликации и сортировки)
         """
         filtered = []
+        skipped_count = 0
+        skipped_reasons = {
+            "low_impression": 0,
+            "old_date": 0,
+            "no_date_low_impression": 0,
+            "parse_error": 0
+        }
         
-        for video in videos:
+        log.info(f"  → Фильтрация {len(videos)} видео по критериям: impression >= {config.MIN_IMPRESSIONS}, дата <= {config.DAYS_BACK} дней")
+        
+        # Логируем примеры первых 5 видео для диагностики
+        if len(videos) > 0:
+            log.info(f"  → Примеры данных для диагностики (первые 5 видео):")
+            for idx in range(min(5, len(videos))):
+                v = videos[idx]
+                imp = v.get("impression", "N/A")
+                date = v.get("first_seen", "N/A")
+                log.info(f"     Видео {idx+1}: impression={imp}, first_seen={date}")
+        
+        for idx, video in enumerate(videos, 1):
             # Проверка impression (может быть строкой "170.6K" или числом)
             impression = video.get("impression", 0)
             impression_num = 0
+            impression_raw = str(impression) if impression else "N/A"
+            
             if isinstance(impression, str):
                 # Парсим строку в число для сравнения
                 impression_num = validator.parse_impressions(impression) or 0
+                if impression_num == 0 and impression and impression != "N/A":
+                    # Логируем ошибки парсинга для первых 10 видео
+                    if idx <= 10:
+                        log.warning(f"  ⚠️ Видео {idx}: не удалось распарсить impression '{impression}'")
             elif isinstance(impression, (int, float)):
                 impression_num = int(impression)
+            else:
+                # Если impression вообще не установлен или None
+                impression_num = 0
+                if idx <= 10:
+                    log.warning(f"  ⚠️ Видео {idx}: impression отсутствует или имеет неожиданный тип: {type(impression)}")
             
+            # Проверка impression
             if not validator.validate_impressions(impression_num, config.MIN_IMPRESSIONS):
-                log.debug(f"Видео пропущено: impression {impression} ({impression_num}) < {config.MIN_IMPRESSIONS}")
+                reason = f"impression {impression_raw} ({impression_num}) < {config.MIN_IMPRESSIONS}"
+                log.debug(f"  ❌ Видео {idx}: пропущено - {reason}")
+                skipped_reasons["low_impression"] += 1
+                skipped_count += 1
                 continue
             
             # Проверка даты (если есть)
             first_seen = video.get("first_seen")
+            first_seen_raw = str(first_seen) if first_seen else "N/A"
+            
             if first_seen and first_seen != "N/A" and first_seen is not None:
                 parsed_date = validator.parse_video_date(first_seen)
                 if parsed_date:
                     if not validator.is_date_within_days(parsed_date, config.DAYS_BACK):
-                        log.debug(f"Видео пропущено: дата {first_seen} старше {config.DAYS_BACK} дней")
+                        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                        cutoff_date = today - timedelta(days=config.DAYS_BACK)
+                        days_old = (today - parsed_date).days
+                        reason = f"дата {first_seen_raw} ({days_old} дней назад) старше {config.DAYS_BACK} дней (cutoff: {cutoff_date.strftime('%Y-%m-%d')})"
+                        log.debug(f"  ❌ Видео {idx}: пропущено - {reason}")
+                        skipped_reasons["old_date"] += 1
+                        skipped_count += 1
                         continue
-                else:
-                    # Если не удалось распарсить, но есть impression >= минимума, пропускаем проверку даты
-                    if impression_num >= config.MIN_IMPRESSIONS:
-                        log.debug(f"Видео принято: не удалось распарсить дату {first_seen}, но impression {impression_num} >= {config.MIN_IMPRESSIONS}")
                     else:
-                        log.debug(f"Видео пропущено: не удалось распарсить дату {first_seen} и impression {impression_num} < {config.MIN_IMPRESSIONS}")
+                        # Дата в пределах допустимого диапазона
+                        days_old = (datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - parsed_date).days
+                        # Логируем принятые видео для первых 10
+                        if idx <= 10:
+                            log.info(f"  ✅ Видео {idx}: принято - impression={impression_num}, first_seen={first_seen_raw} ({days_old} дней назад)")
+                        else:
+                            log.debug(f"  ✅ Видео {idx}: принято - impression={impression_num}, first_seen={first_seen_raw} ({days_old} дней назад)")
+                else:
+                    # Если не удалось распарсить дату, но есть impression >= минимума, принимаем
+                    if impression_num >= config.MIN_IMPRESSIONS:
+                        if idx <= 10:
+                            log.info(f"  ⚠️ Видео {idx}: принято (дата не распарсена '{first_seen_raw}', но impression {impression_num} >= {config.MIN_IMPRESSIONS})")
+                        else:
+                            log.debug(f"  ⚠️ Видео {idx}: принято (дата не распарсена '{first_seen_raw}', но impression {impression_num} >= {config.MIN_IMPRESSIONS})")
+                    else:
+                        reason = f"не удалось распарсить дату '{first_seen_raw}' и impression {impression_num} < {config.MIN_IMPRESSIONS}"
+                        log.debug(f"  ❌ Видео {idx}: пропущено - {reason}")
+                        skipped_reasons["parse_error"] += 1
+                        skipped_count += 1
                         continue
             # Если даты нет, но impression >= минимума, принимаем видео
             elif impression_num >= config.MIN_IMPRESSIONS:
-                log.debug(f"Видео принято: нет даты, но impression {impression_num} >= {config.MIN_IMPRESSIONS}")
+                if idx <= 10:
+                    log.info(f"  ✅ Видео {idx}: принято - нет даты, но impression {impression_num} >= {config.MIN_IMPRESSIONS}")
+                else:
+                    log.debug(f"  ✅ Видео {idx}: принято - нет даты, но impression {impression_num} >= {config.MIN_IMPRESSIONS}")
             else:
-                log.debug("Видео пропущено: нет даты first_seen и impression < минимума")
+                reason = f"нет даты и impression {impression_num} < {config.MIN_IMPRESSIONS}"
+                log.debug(f"  ❌ Видео {idx}: пропущено - {reason}")
+                skipped_reasons["no_date_low_impression"] += 1
+                skipped_count += 1
                 continue
             
             # Сохраняем числовое значение для сортировки
             video["_impression_num"] = impression_num
             filtered.append(video)
         
-        log.info(f"✅ Отфильтровано {len(filtered)} подходящих видео из {len(videos)}")
+        # Детальная статистика
+        log.info(f"  📊 Статистика фильтрации:")
+        log.info(f"     ✅ Принято: {len(filtered)} видео")
+        log.info(f"     ❌ Пропущено: {skipped_count} видео")
+        if skipped_count > 0:
+            log.info(f"     📋 Причины пропуска:")
+            if skipped_reasons["low_impression"] > 0:
+                log.info(f"        - Низкий impression: {skipped_reasons['low_impression']}")
+            if skipped_reasons["old_date"] > 0:
+                log.info(f"        - Дата старше {config.DAYS_BACK} дней: {skipped_reasons['old_date']}")
+            if skipped_reasons["no_date_low_impression"] > 0:
+                log.info(f"        - Нет даты + низкий impression: {skipped_reasons['no_date_low_impression']}")
+            if skipped_reasons["parse_error"] > 0:
+                log.info(f"        - Ошибка парсинга: {skipped_reasons['parse_error']}")
+        
+        log.info(f"  ✅ Отфильтровано {len(filtered)} подходящих видео из {len(videos)}")
         return filtered
     
     def _select_top_videos(self, videos: List[Dict[str, Any]], top_n: int = 3) -> List[Dict[str, Any]]:
@@ -2000,18 +2179,20 @@ class ParserEngine:
             else:
                 log.info(f"⏭️  Видео пропущено как дубликат: {video_id}")
         
-        # Сортируем: сначала по дате (самые недавние), потом по impressions (самые большие)
+        # Сортируем: сначала по impression (самые большие), потом по дате (самые недавние)
+        # Цель: топ-N видео по просмотрам (impression)
         def sort_key(v):
+            impression_num = v.get("_impression_num", 0)
             parsed_date = validator.parse_video_date(v.get("first_seen", ""))
             if parsed_date:
                 date_timestamp = -parsed_date.timestamp()  # Отрицательное для сортировки по убыванию (самые недавние)
             else:
                 date_timestamp = 0  # Видео без даты в конец
-            return (date_timestamp, -v.get("_impression_num", 0))
+            return (-impression_num, date_timestamp)  # Сначала по impression (убывание), потом по дате
         
         unique_videos.sort(key=sort_key)
         
-        # Берем топ-N
+        # Берем топ-N по просмотрам (impression)
         top_videos = unique_videos[:top_n]
         
         log.info(f"✅ Выбрано топ-{top_n} из {len(unique_videos)} уникальных видео")
@@ -2100,18 +2281,20 @@ class ParserEngine:
             else:
                 log.info(f"⏭️  Видео пропущено как дубликат: {video_id}")
         
-        # Сортируем: сначала по дате (самые недавние), потом по impressions (самые большие)
+        # Сортируем: сначала по impression (самые большие), потом по дате (самые недавние)
+        # Цель: топ-3 видео по просмотрам (impression)
         def sort_key(v):
+            impression_num = v.get("_impression_num", 0)
             parsed_date = validator.parse_video_date(v.get("first_seen", ""))
             if parsed_date:
                 date_timestamp = -parsed_date.timestamp()  # Отрицательное для сортировки по убыванию (самые недавние)
             else:
                 date_timestamp = 0  # Видео без даты в конец
-            return (date_timestamp, -v.get("_impression_num", 0))
+            return (-impression_num, date_timestamp)  # Сначала по impression (убывание), потом по дате
         
         unique_videos.sort(key=sort_key)
         
-        # Берем топ-3
+        # Берем топ-3 по просмотрам (impression)
         top_videos = unique_videos[:3]
         
         log.info(f"✅ Отфильтровано {len(filtered)} видео из {len(videos)}, уникальных: {len(unique_videos)}, топ-3: {len(top_videos)}")

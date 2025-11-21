@@ -105,28 +105,61 @@ def parse_impressions(impressions_str: str) -> Optional[int]:
     if not impressions_str or impressions_str.strip() == "N/A":
         return None
     
-    # Убираем пробелы и запятые
-    clean_str = impressions_str.strip().replace(",", "").replace(" ", "")
+    # Убираем пробелы, запятые и другие разделители
+    clean_str = impressions_str.strip().replace(",", "").replace(" ", "").replace("'", "").replace("\"", "")
     
-    # Обработка формата "15.1K", "1.5M" и т.д.
+    # Убираем все нецифровые символы кроме точки, минуса и K/M
+    # Но сохраняем K и M в конце
     if clean_str.upper().endswith("K"):
         try:
-            number = float(clean_str[:-1])
-            return int(number * 1000)
-        except ValueError:
-            return None
+            # Пробуем извлечь число перед K
+            number_part = clean_str[:-1]
+            # Убираем все кроме цифр и точки
+            number_part = ''.join(c for c in number_part if c.isdigit() or c == '.')
+            if number_part:
+                number = float(number_part)
+                return int(number * 1000)
+        except (ValueError, AttributeError):
+            pass
     elif clean_str.upper().endswith("M"):
         try:
-            number = float(clean_str[:-1])
-            return int(number * 1000000)
-        except ValueError:
-            return None
+            # Пробуем извлечь число перед M
+            number_part = clean_str[:-1]
+            # Убираем все кроме цифр и точки
+            number_part = ''.join(c for c in number_part if c.isdigit() or c == '.')
+            if number_part:
+                number = float(number_part)
+                return int(number * 1000000)
+        except (ValueError, AttributeError):
+            pass
     
-    # Обычное число
-    try:
-        return int(float(clean_str))
-    except ValueError:
-        return None
+    # Пробуем извлечь число из строки (убираем все кроме цифр и точки)
+    number_str = ''.join(c for c in clean_str if c.isdigit() or c == '.')
+    if number_str:
+        try:
+            return int(float(number_str))
+        except ValueError:
+            pass
+    
+    # Если ничего не помогло, пробуем найти число в строке через regex
+    import re
+    # Ищем паттерны типа "123", "123.5", "123K", "123M"
+    match = re.search(r'([\d.]+)\s*([KMkm]?)', clean_str)
+    if match:
+        number_str = match.group(1)
+        suffix = match.group(2).upper() if match.group(2) else ""
+        try:
+            number = float(number_str)
+            if suffix == "K":
+                return int(number * 1000)
+            elif suffix == "M":
+                return int(number * 1000000)
+            else:
+                return int(number)
+        except ValueError:
+            pass
+    
+    return None
 
 
 def validate_url(url: str) -> bool:

@@ -15,6 +15,7 @@ from src.parser_engine import ParserEngine, ProductData
 from src.sheets_writer import SheetsWriter
 from src import config
 from src import logger
+from src import validator
 
 log = logger.get_logger("TestParserEngine")
 
@@ -312,6 +313,20 @@ async def test_parser_engine():
                     # Извлекаем ТОП-3 видео (по impression) из ВСЕХ видео с полными данными
                     if hasattr(product_data, '_all_videos_raw'):
                         all_videos = product_data._all_videos_raw
+                        # Формируем список всех видео с названием, impression и first_seen
+                        all_videos_list = []
+                        for v in all_videos:
+                            video_name = v.get("video_name", "N/A")
+                            impression = v.get("impression", "N/A")
+                            impression_num = v.get("_impression_num", 0)
+                            first_seen = v.get("first_seen", "N/A")
+                            all_videos_list.append({
+                                "video_name": video_name,
+                                "impression": impression,
+                                "impression_num": impression_num,
+                                "first_seen": first_seen
+                            })
+                        analytics_entry["all_videos"] = all_videos_list  # Все видео отсортированные по impression
                         # Сортируем по impression (desc) и берем топ-3
                         sorted_videos = sorted(all_videos, key=lambda v: v.get('impression', 0) if isinstance(v.get('impression'), (int, float)) else 0, reverse=True)
                         for i, video in enumerate(sorted_videos[:3], 1):
@@ -490,6 +505,36 @@ async def test_parser_engine():
                             if product['videos_found'] == 0:
                                 reason = "Не найдено подходящих видео (все отфильтрованы по критериям)"
                             f.write(f"**Решение:** Товар пропущен - {reason}\n\n")
+                        
+                        # ВСЕ СОБРАННЫЕ ВИДЕО (отсортированные по impression)
+                        if 'all_videos' in product and product['all_videos']:
+                            f.write("#### 📋 ВСЕ СОБРАННЫЕ ВИДЕО (отсортированы по impression, от большего к меньшему):\n\n")
+                            f.write(f"**Всего собрано:** {len(product['all_videos'])} видео\n\n")
+                            for vid_idx, vid in enumerate(product['all_videos'][:30], 1):  # Показываем первые 30
+                                name = vid.get('video_name', 'N/A')
+                                imp = vid.get('impression', 'N/A')
+                                imp_num = vid.get('impression_num', 0)
+                                date = vid.get('first_seen', 'N/A')
+                                # Определяем, прошло ли видео фильтрацию
+                                passed_filter = False
+                                if imp_num >= config.MIN_IMPRESSIONS:
+                                    if date != 'N/A' and date:
+                                        parsed_date = validator.parse_video_date(date)
+                                        if parsed_date:
+                                            if validator.is_date_within_days(parsed_date, config.DAYS_BACK):
+                                                passed_filter = True
+                                        else:
+                                            # Если дата не распарсилась, но impression >= минимума, тоже проходит
+                                            passed_filter = True
+                                    else:
+                                        # Нет даты, но impression >= минимума, проходит
+                                        passed_filter = True
+                                
+                                status_icon = "✅" if passed_filter else "❌"
+                                f.write(f"{vid_idx}. {status_icon} **{name[:100]}** | impression: {imp} ({imp_num}) | first_seen: {date}\n")
+                            if len(product['all_videos']) > 30:
+                                f.write(f"\n... и еще {len(product['all_videos']) - 30} видео\n")
+                            f.write("\n")
                         
                         # ТОП-3 видео с полными артефактами
                         if product['top_3_videos']:

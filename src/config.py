@@ -46,10 +46,10 @@ GOOGLE_SHEETS_SHEET_NAME = os.getenv(
 GOOGLE_CREDENTIALS_PATH = CONFIG_DIR / "google-credentials.json"
 
 # Параметры фильтрации видео
-# УСЛАБЛЕНО для рабочей версии: снижены требования для быстрого запуска
-MIN_IMPRESSIONS = int(os.getenv("MIN_IMPRESSIONS", "1000"))  # Минимум 1K impressions (было 5K)
+# Глобальная логика: скрипт запускается в первый день недели для проверки результатов за прошлую неделю (последние 7 дней)
+MIN_IMPRESSIONS = int(os.getenv("MIN_IMPRESSIONS", "1000"))  # Минимум 1K impressions
 PRIORITY_IMPRESSIONS = int(os.getenv("PRIORITY_IMPRESSIONS", "100000"))
-DAYS_BACK = int(os.getenv("DAYS_BACK", "60"))  # Видео не старше 60 дней (было 30)
+DAYS_BACK = int(os.getenv("DAYS_BACK", "7"))  # Видео СТРОГО не старше 7 дней от сегодня (для анализа прошлой недели)
 
 # Настройки браузера
 BROWSER_HEADLESS = os.getenv("BROWSER_HEADLESS", "true").lower() == "true"
