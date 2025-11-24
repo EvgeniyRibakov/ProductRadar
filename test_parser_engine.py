@@ -6,6 +6,7 @@ import asyncio
 import sys
 import os
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 # Добавляем путь к src
 sys.path.insert(0, str(Path(__file__).parent))
@@ -140,7 +141,9 @@ async def test_parser_engine():
             return url
         
         # Главный цикл обработки
-        while successful_products < MIN_PRODUCTS_TO_COLLECT and checked_products < MAX_PRODUCTS_TO_CHECK:
+        # Продолжаем до достижения лимита проверок (MAX_PRODUCTS_TO_CHECK)
+        # Цель (MIN_PRODUCTS_TO_COLLECT) может быть достигнута раньше, но продолжаем проверять до лимита
+        while checked_products < MAX_PRODUCTS_TO_CHECK:
             
             # 7.1. Получение списка товаров с главной страницы (текущее состояние)
             log.info(f"\n{'='*80}")
@@ -156,8 +159,17 @@ async def test_parser_engine():
                 break
             
             if not products:
-                log.error("❌ Не удалось получить товары, завершаем")
-                break
+                log.warning("⚠️ Не удалось получить товары на текущей странице")
+                # Если не достигнут лимит, переключаемся на следующую страницу
+                if checked_products < MAX_PRODUCTS_TO_CHECK:
+                    log.info("   Пробуем переключиться на следующую страницу...")
+                    # Переключение будет выполнено в блоке 7.7 ниже
+                    # Продолжаем цикл, чтобы выполнить переключение
+                else:
+                    log.error("   Достигнут лимит проверок, завершаем")
+                    break
+                # Пропускаем обработку пустого списка, переходим к переключению страницы
+                continue
             
             log.info(f"✅ Получено {len(products)} товаров на текущей странице")
             
@@ -196,6 +208,18 @@ async def test_parser_engine():
             
             products = unique_products  # Используем только уникальные товары
             log.info(f"✅ После дедупликации: {len(products)} уникальных товаров для обработки")
+            
+            # Если после дедупликации не осталось товаров, переключаемся на следующую страницу
+            if len(products) == 0:
+                if checked_products < MAX_PRODUCTS_TO_CHECK:
+                    log.info(f"⚠️ На текущей странице не осталось новых товаров (все уже обработаны)")
+                    log.info(f"   Переключимся на следующую страницу в конце итерации...")
+                    # Пропускаем обработку пустого списка, переходим к переключению страницы
+                else:
+                    log.warning(f"⚠️ На текущей странице не осталось новых товаров и достигнут лимит проверок")
+                    break
+                # Пропускаем цикл по товарам, переходим к переключению страницы
+                # (переключение будет выполнено в блоке 7.7 ниже)
             
             # 7.2. Цикл по товарам на текущей странице
             for product_index, product in enumerate(products):
@@ -419,7 +443,75 @@ async def test_parser_engine():
             # 7.6. Проверка условий выхода из главного цикла
             # Останавливаемся только при достижении лимита проверок
             if checked_products >= MAX_PRODUCTS_TO_CHECK:
+                log.info(f"\n⚠️ Достигнут лимит проверок ({MAX_PRODUCTS_TO_CHECK} товаров)")
                 break
+            
+            # 7.7. Переключение на следующую страницу поиска товаров
+            # Если не достигнут лимит, переключаемся на следующую страницу
+            if checked_products < MAX_PRODUCTS_TO_CHECK:
+                # Проверяем, были ли обработаны все товары с текущей страницы
+                # Если все товары были дубликатами или пропущены, переключаемся на следующую страницу
+                if len(products) == 0:
+                    log.info(f"\n🔄 На текущей странице не осталось новых товаров, переключаемся на следующую страницу...")
+                else:
+                    log.info(f"\n🔄 Переключение на следующую страницу поиска...")
+                
+                try:
+                    # Получаем текущий URL страницы поиска
+                    current_url = parser.page.url
+                    log.info(f"   Текущий URL: {current_url}")
+                    
+                    # Парсим URL
+                    parsed_url = urlparse(current_url)
+                    query_params = parse_qs(parsed_url.query)
+                    
+                    # Извлекаем current_page
+                    current_page = int(query_params.get('current_page', ['1'])[0])
+                    log.info(f"   Текущая страница: {current_page}")
+                    
+                    # Увеличиваем на 1
+                    next_page = current_page + 1
+                    query_params['current_page'] = [str(next_page)]
+                    
+                    # Формируем новый URL
+                    new_query = urlencode(query_params, doseq=True)
+                    new_url = urlunparse((
+                        parsed_url.scheme,
+                        parsed_url.netloc,
+                        parsed_url.path,
+                        parsed_url.params,
+                        new_query,
+                        parsed_url.fragment
+                    ))
+                    
+                    log.info(f"   Переключение на страницу {next_page}...")
+                    log.info(f"   Новый URL: {new_url}")
+                    
+                    # Переходим на новую страницу
+                    await parser.page.goto(new_url, wait_until="domcontentloaded", timeout=30000)
+                    await parser.human_delay(2, 3)
+                    
+                    # Проверяем, что переключение прошло успешно (URL изменился)
+                    actual_url = parser.page.url
+                    if str(next_page) not in actual_url:
+                        log.warning(f"   ⚠️ Переключение на страницу {next_page} может не удаться (URL: {actual_url})")
+                        # Продолжаем, возможно страница загрузилась, но URL не обновился
+                    
+                    log.info(f"   ✅ Переключились на страницу {next_page}")
+                    # Продолжаем цикл while - следующая итерация получит товары со страницы 2
+                    
+                except Exception as e:
+                    log.error(f"   ❌ Ошибка при переключении на следующую страницу: {e}")
+                    # Если не удалось переключиться, возможно, следующей страницы нет
+                    # Пробуем еще раз или завершаем, если достигнут лимит
+                    if checked_products >= MAX_PRODUCTS_TO_CHECK - 5:  # Если близко к лимиту, завершаем
+                        log.error(f"   Завершаем обработку (не удалось переключить страницу, близко к лимиту)")
+                        break
+                    else:
+                        log.warning(f"   Пробуем продолжить (ошибка переключения, но не достигнут лимит)")
+                        # Продолжаем цикл, возможно следующая итерация получит товары
+            else:
+                log.info(f"\n⚠️ Достигнут лимит проверок ({MAX_PRODUCTS_TO_CHECK} товаров), не переключаемся на следующую страницу")
         
         # 8. Итоговый отчет
         log.info(f"\n{'='*80}")
