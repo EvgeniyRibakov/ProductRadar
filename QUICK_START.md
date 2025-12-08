@@ -53,6 +53,12 @@ python test_google_sheets.py
 
 Теперь вы можете использовать MCP для работы с Google Sheets в проекте.
 
+## 🤖 Запуск Telegram бота
+
+```bash
+python run_telegram_bot.py
+```
+
 ## 📋 Полезные ссылки
 
 - Подробная инструкция: `config/README.md`

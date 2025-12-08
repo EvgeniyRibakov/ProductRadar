@@ -750,15 +750,6 @@ async def test_parser_engine():
         log.info("✅ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО УСПЕШНО")
         log.info("=" * 60)
         
-        # Удаление неполных строк из Google Sheets
-        if sheets_writer and sheets_writer.worksheet:
-            log.info("\n🧹 Удаление неполных строк из Google Sheets...")
-            deleted_count = sheets_writer.delete_incomplete_rows()
-            if deleted_count > 0:
-                log.info(f"✅ Удалено {deleted_count} неполных строк")
-            else:
-                log.info("✅ Неполных строк не найдено")
-        
         # Задержка перед закрытием (для просмотра результата)
         log.info("\n⏸️ Ожидание 10 секунд перед закрытием браузера (для просмотра результата)...")
         log.info("   Нажмите Ctrl+C, если хотите закрыть раньше")
