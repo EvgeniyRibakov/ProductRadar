@@ -1,10 +1,12 @@
-# Google Sheets credentials
+# Google Sheets credentials (НЕ пушить в Git!)
 config/google-credentials.json
 config/*.json
+!config/.env_sample  # Шаблон можно пушить
 
-# Environment variables
+# Environment variables (НЕ пушить в Git!)
 .env
 .env.local
+config/.env
 
 # Python
 __pycache__/
